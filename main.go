@@ -89,12 +89,12 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 		addLabelsAndResourceAttributes(datapoint, countDp, resourceAttributes)
 		// Max datapoint
 		minDp := maxMetric.DoubleSum().DataPoints().AppendEmpty()
-		minDp.SetValue(datapoint.QuantileValues().At(0).Value())
+		minDp.SetValue(datapoint.QuantileValues().At(1).Value())
 		minDp.SetTimestamp(datapoint.Timestamp())
 		addLabelsAndResourceAttributes(datapoint, minDp, resourceAttributes)
 		// Min datapoint
 		maxDp := minMetric.DoubleSum().DataPoints().AppendEmpty()
-		maxDp.SetValue(datapoint.QuantileValues().At(1).Value())
+		maxDp.SetValue(datapoint.QuantileValues().At(0).Value())
 		maxDp.SetTimestamp(datapoint.Timestamp())
 		addLabelsAndResourceAttributes(datapoint, maxDp, resourceAttributes)
 	}
