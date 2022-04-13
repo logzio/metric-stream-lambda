@@ -20,3 +20,12 @@ aws lambda update-function-code \
 --function-name cloudwatch-stream-otlp \
 --zip-file fileb://function.zip
 ```
+## Stream test data to cloudwatch-stream-otlp-dev function
+* start stream:
+```shell
+aws cloudwatch start-metric-streams --names test-otel-format
+```
+* stop stream:
+```shell
+aws cloudwatch stop-metric-streams --names test-otel-format
+```
