@@ -6,7 +6,6 @@ import (
 	base64 "encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/aws/aws-lambda-go/lambda"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
@@ -15,6 +14,9 @@ import (
 	"go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
 	_ "go.opentelemetry.io/otel/metric"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	"io/ioutil"
+	"os"
+	"regexp"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -52,7 +54,15 @@ func createMetricFromAttributes(metric pdata.Metric, suffix string) pdata.Metric
 // Takes origin datapoint, destination datapoint and resource attributes. Coping labels from origin and adding resource attributes as labels
 func addLabelsAndResourceAttributes(dp pdata.SummaryDataPoint, destDp pdata.DoubleDataPoint, resourceAttributes pdata.AttributeMap) {
 	dp.LabelsMap().Range(func(k string, v string) bool {
-		destDp.LabelsMap().Insert(strings.ToLower(k), strings.ToLower(v))
+		v = strings.ReplaceAll(v, " ", "_")
+		snakeKey := ToSnake(k)
+		if k == "Namespace" {
+			destDp.LabelsMap().Insert(strings.ToLower(snakeKey), strings.ToLower(v))
+		} else if strings.Contains(snakeKey, "db_") {
+			destDp.LabelsMap().Insert(strings.ReplaceAll(snakeKey, "db_", "db"), v)
+		} else {
+			destDp.LabelsMap().Insert(ToSnake(k), v)
+		}
 		return true
 	})
 	accountId, _ := resourceAttributes.Get("cloud.account.id")
@@ -61,11 +71,52 @@ func addLabelsAndResourceAttributes(dp pdata.SummaryDataPoint, destDp pdata.Doub
 	destDp.LabelsMap().Insert("region", region.StringVal())
 }
 
+func ToSnake(str string) string {
+	var matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+	var matchAllCap = regexp.MustCompile("([a-z0-9])([A-Z])")
+	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
+	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
+	return strings.ToLower(snake)
+}
+
+// Converts to new name (example: amazonaws.com/AWS/AppRunner/ActiveInstances -> aws_apprunner_active_instances) to prevent logz.io dashboards from being broken
+func generateMetricName(metric pdata.Metric) string {
+	// TODO optinal: optimization to string manipulation
+	metricName := strings.ReplaceAll(metric.Name(), "/", "")
+	metricName = strings.ReplaceAll(metricName, "amazonaws.com", "")
+	metricName = strings.ReplaceAll(metricName, "AWS", "aws")
+	metricName = ToSnake(metricName)
+	// For cases when the origin name contains "_" (example: amazonaws.com/AWS/EC2/StatusCheckFailed_System)
+	if strings.Contains(metric.Name(), "_") {
+		metricName = strings.ReplaceAll(metricName, "__", "_")
+	}
+	// For cases when the origin name contains status codes like "5xx" (example: amazonaws.com/AWS/S3/5xxErrors)
+	if strings.Contains(metric.Name(), "2xx") {
+		metricName = strings.ReplaceAll(metricName, "2xx", "_2xx")
+	}
+	if strings.Contains(metric.Name(), "3xx") {
+		metricName = strings.ReplaceAll(metricName, "3xx", "_3xx")
+	}
+	if strings.Contains(metric.Name(), "4xx") {
+		metricName = strings.ReplaceAll(metricName, "4xx", "_4xx")
+	}
+	if strings.Contains(metric.Name(), "5xx") {
+		metricName = strings.ReplaceAll(metricName, "5xx", "_5xx")
+	}
+	// For cases when the new name contains "." (aws_kinesis_put_record._latency)
+	if strings.Contains(metricName, ".") {
+		metricName = strings.ReplaceAll(metricName, ".", "")
+	}
+	// For cases when the origin name contains "ID" (example: amazonaws.com/AWS/RDS/MaximumUsedTransactionIDs)
+	if strings.Contains(metric.Name(), "ID") {
+		metricName = strings.ReplaceAll(metricName, "i_d", "id")
+	}
+	return metricName
+}
+
 // Takes Summary metric and generates new metrics (sum, count, min, max) than add them to metricsToSend
 func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetricsSlice, metric pdata.Metric, resourceAttributes pdata.AttributeMap) {
-	// Converts to new name (example: amazonaws.com/AWS/AppRunner/ActiveInstances -> aws_apprunner_activeinstances)
-	newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(metric.Name(), "/", "_")), "amazonaws.com_", "")
-	metric.SetName(newName)
+	metric.SetName(generateMetricName(metric))
 	// Assuming Summary metric type according to AWS docs:
 	// https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/acw-ug.pdf#CloudWatch-metric-streams-formats-opentelemetry
 	// Page 262
@@ -88,13 +139,13 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 		countDp.SetTimestamp(datapoint.Timestamp())
 		addLabelsAndResourceAttributes(datapoint, countDp, resourceAttributes)
 		// Max datapoint
-		minDp := maxMetric.DoubleSum().DataPoints().AppendEmpty()
-		minDp.SetValue(datapoint.QuantileValues().At(1).Value())
+		minDp := minMetric.DoubleSum().DataPoints().AppendEmpty()
+		minDp.SetValue(datapoint.QuantileValues().At(0).Value())
 		minDp.SetTimestamp(datapoint.Timestamp())
 		addLabelsAndResourceAttributes(datapoint, minDp, resourceAttributes)
 		// Min datapoint
-		maxDp := minMetric.DoubleSum().DataPoints().AppendEmpty()
-		maxDp.SetValue(datapoint.QuantileValues().At(0).Value())
+		maxDp := maxMetric.DoubleSum().DataPoints().AppendEmpty()
+		maxDp.SetValue(datapoint.QuantileValues().At(1).Value())
 		maxDp.SetTimestamp(datapoint.Timestamp())
 		addLabelsAndResourceAttributes(datapoint, maxDp, resourceAttributes)
 	}
@@ -108,6 +159,7 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	log.Println("Getting secretes from header")
 	metricCount := 0
+	datapointCount := 0
 	var ca map[string]interface{}
 	json.Unmarshal([]byte(request.Headers["x-amz-firehose-common-attributes"]), &ca)
 	if ca == nil {
@@ -131,7 +183,7 @@ func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	}
 	buildInfo := component.BuildInfo{
 		Description: "OpenTelemetry",
-		Version:     "1.0",
+		Version:     "0.7",
 	}
 	cfg.HTTPClientSettings.Endpoint = LISTENER_URL
 	cfg.HTTPClientSettings.Headers = map[string]string{
@@ -177,9 +229,9 @@ func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		}
 		// Converting otlp proto bytes to pdata.metrics
 		metrics, err := pdata.MetricsFromOtlpProtoBytes(protoBytes)
-		// represents the metrics to send after converting from summary to sum, count, min, max (those are the metrics we are actually going to send)
+		// represents metrics after converting from summary to sum, count, min, max (those are the metrics we are actually going to send)
 		metricsToSend := pdata.NewMetrics()
-		aggregatedInstrumentationLibraryMetrics := metricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
+		instrumentationLibraryMetricsToSend := metricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
 		// Lopping threw all metrics and data points, generate new metrics (sum, count, min, max) and enhance labels with logz.io naming conventions and resource attributes
 		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
 			resource := metrics.ResourceMetrics().At(i)
@@ -188,17 +240,18 @@ func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 				instrumentationLibraryMetrics := resource.InstrumentationLibraryMetrics().At(j)
 				for k := 0; k < instrumentationLibraryMetrics.Metrics().Len(); k++ {
 					metric := instrumentationLibraryMetrics.Metrics().At(k)
-					summaryValuesToMetrics(aggregatedInstrumentationLibraryMetrics, metric, resourceAttributes)
+					summaryValuesToMetrics(instrumentationLibraryMetricsToSend, metric, resourceAttributes)
 				}
 			}
 		}
 		numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()
-		log.Println(fmt.Sprintf("Found %d new metircs with %d datapoints", numberOfMetrics, numberOfDataPoints))
+		log.Println(fmt.Sprintf("Found %d new metrics with %d datapoints", numberOfMetrics, numberOfDataPoints))
 		if err != nil {
 			log.Printf("Error: %s", err)
 			return events.APIGatewayProxyResponse{Body: "Error", StatusCode: 500}, err
 		}
 		metricCount += numberOfMetrics
+		datapointCount += numberOfDataPoints
 		log.Println("Sending metrics")
 		err = metricsExporter.PushMetrics(ctx, metricsToSend)
 		if err != nil {
@@ -206,7 +259,7 @@ func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			return events.APIGatewayProxyResponse{Body: "Error while pushing metrics", StatusCode: 500}, err
 		}
 	}
-	log.Printf("Found total of %d metics", metricCount)
+	log.Printf("Found total of %d metrics with %d datapoints", metricCount, datapointCount)
 	log.Println("Shutting down metrics exporter")
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
@@ -217,5 +270,17 @@ func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 }
 
 func main() {
-	lambda.Start(handleRequest)
+	//lambda.Start(handleRequest)
+	jsonFile, err := os.Open("testEvent.json")
+	// if we os.Open returns an error then handle it
+	if err != nil {
+		fmt.Println(err)
+	}
+	defer jsonFile.Close()
+	ctx := context.Background()
+	byteValue, _ := ioutil.ReadAll(jsonFile)
+	request := events.APIGatewayProxyRequest{}
+	json.Unmarshal(byteValue, &request)
+	result, _ := handleRequest(ctx, request)
+	log.Println(result)
 }
