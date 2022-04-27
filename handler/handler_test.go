@@ -13,7 +13,6 @@ import (
 
 func TestHandleRequest(t *testing.T) {
 	jsonFile, err := os.Open("../testdata/validEvent.json")
-	// if we os.Open returns an error then handle it
 	if err != nil {
 		fmt.Println(err)
 	}

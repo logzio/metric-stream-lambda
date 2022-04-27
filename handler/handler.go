@@ -29,7 +29,7 @@ const (
 	maxStr   = "_max"
 )
 
-// Lmabda response
+// Lambda response
 type response struct {
 	message string `json:"message"`
 }
@@ -146,14 +146,29 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 }
 
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	log.Println("Getting access key from headers")
 	metricCount := 0
 	dataPointCount := 0
-	LOGZIO_TOKEN := request.Headers["X-Amz-Firehose-Access-Key"]
-	if LOGZIO_TOKEN == "" {
-		LOGZIO_TOKEN = request.Headers["x-amz-firehose-access-key"]
+	ListenerUrl := ""
+	// extract parameters
+	var ca map[string]interface{}
+	err := json.Unmarshal([]byte(request.Headers["x-amz-firehose-common-attributes"]), &ca)
+	if ca == nil {
+		json.Unmarshal([]byte(request.Headers["X-Amz-Firehose-Common-Attributes"]), &ca)
 	}
-	LISTENER_URL := getListenerUrl()
+	if ca != nil {
+		parameterMap := ca["commonAttributes"].(map[string]interface{})
+		ListenerUrl = parameterMap["CUSTOM_LISTENER"].(string)
+	}
+	if ListenerUrl == "" {
+		ListenerUrl = getListenerUrl()
+	}
+
+	log.Println("Getting access key from headers")
+	LogzioToken := request.Headers["X-Amz-Firehose-Access-Key"]
+	if LogzioToken == "" {
+		LogzioToken = request.Headers["x-amz-firehose-access-key"]
+	}
+
 	// Initializing prometheus remote write exporter
 	cfg := &prometheusremotewriteexporter.Config{
 		TimeoutSettings: exporterhelper.TimeoutSettings{},
@@ -165,15 +180,15 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		Namespace:      "",
 		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-cloudwatch-stream-metrics"},
 		HTTPClientSettings: confighttp.HTTPClientSettings{
-			Endpoint: LISTENER_URL,
-			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LOGZIO_TOKEN)},
+			Endpoint: ListenerUrl,
+			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LogzioToken)},
 		},
 	}
+	cfg.RemoteWriteQueue.NumConsumers = 3
 	buildInfo := component.BuildInfo{
 		Description: "OpenTelemetry",
 		Version:     "0.7",
 	}
-	cfg.RemoteWriteQueue.NumConsumers = 3
 	log.Println("Starting metrics exporter")
 	metricsExporter, err := prometheusremotewriteexporter.NewPRWExporter(cfg, buildInfo)
 	if err != nil {
