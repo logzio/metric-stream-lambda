@@ -1,4 +1,4 @@
-module main
+module github.com/logzio/metric-stream-lambda
 
 go 1.17
 
@@ -17,7 +17,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/snappy v0.0.3 // indirect
-	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.7.0 // indirect
 	github.com/jaegertracing/jaeger v1.23.0 // indirect
 	github.com/knadh/koanf v1.1.0 // indirect
