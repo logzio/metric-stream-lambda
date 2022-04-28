@@ -8,6 +8,7 @@ require (
 	go.opentelemetry.io/collector v0.29.0
 	go.opentelemetry.io/otel/metric v0.28.0
 	go.opentelemetry.io/proto/otlp v0.15.0
+	gopkg.in/h2non/gock.v1 v1.1.2
 )
 
 require (
@@ -18,6 +19,7 @@ require (
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/snappy v0.0.3 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.7.0 // indirect
+	github.com/h2non/parth v0.0.0-20190131123155-b4df798d6542 // indirect
 	github.com/jaegertracing/jaeger v1.23.0 // indirect
 	github.com/knadh/koanf v1.1.0 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect

@@ -7,7 +7,7 @@
   "headers": {
     "Content-Length": "332686",
     "Content-Type": "application/json",
-    "Host": "iaxy965hw7.execute-api.us-east-1.amazonaws.com",
+    "Host": ".execute-api.us-east-1.amazonaws.com",
     "User-Agent": "Amazon Kinesis Data Firehose Agent/1.0",
     "X-Amz-Firehose-Access-Key": "token",
     "X-Amz-Firehose-Protocol-Version": "1.0",
@@ -38,13 +38,13 @@
       "1.0"
     ],
     "X-Amz-Firehose-Request-Id": [
-      "16bb3d55-d08b-42d4-9eac-61e4f198f2c8"
+      "-d08b-42d4-9eac-61e4f198f2c8"
     ],
     "X-Amz-Firehose-Source-Arn": [
       "arn:aws:firehose:us-east-1:486140753397:deliverystream/cw-metrics-go"
     ],
     "X-Amzn-Trace-Id": [
-      "Root=1-6267be3b-73483c9e1f48b4bf2047c7f9"
+      "Root=1-6267be3b-"
     ],
     "X-Forwarded-For": [
       "44.192.14.148"
@@ -60,7 +60,7 @@
   "multiValueQueryStringParameters": "",
   "requestContext": {
     "accountId": "486140753397",
-    "apiId": "iaxy965hw7",
+    "apiId": "",
     "domainName": "iaxy965hw7.execute-api.us-east-1.amazonaws.com",
     "domainPrefix": "iaxy965hw7",
     "extendedRequestId": "RLqpThueIAMEPtA=",
@@ -75,8 +75,7 @@
       "cognitoIdentityId": "",
       "cognitoIdentityPoolId": "",
       "principalOrgId": "",
-      "sourceIp": "44.192.14.148",
-      "user": "",
+      "sourceIp": "",
       "userAgent": "Amazon Kinesis Data Firehose Agent/1.0",
       "userArn": ""
     },
