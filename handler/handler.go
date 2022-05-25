@@ -5,6 +5,7 @@ import (
 	_ "context"
 	base64 "encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/golang/protobuf/proto"
@@ -213,8 +214,10 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	}
 
 	if LogzioToken == "" {
-		log.Printf("Cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
-		return generateValidFirehoseResponse(400, requestId, "Cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers", nil), nil
+		message := "cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers"
+		err := errors.New(message)
+		log.Printf(message)
+		return generateValidFirehoseResponse(400, requestId, message, err), err
 	}
 
 	// Initializing prometheus remote write exporter
