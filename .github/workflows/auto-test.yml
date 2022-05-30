@@ -1,7 +1,7 @@
 name: Test Handler
 on:
   pull_request:
-    branches: [ master ]
+    branches: [ master, main ]
 jobs:
   test:
     runs-on: ubuntu-latest
