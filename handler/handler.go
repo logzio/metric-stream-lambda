@@ -30,6 +30,22 @@ const (
 	maxStr   = "_max"
 )
 
+type ErrorCollector []error
+
+func (c *ErrorCollector) Collect(e error) { *c = append(*c, e) }
+
+func (c *ErrorCollector) Length() int {
+	return len(*c)
+}
+
+func (c *ErrorCollector) Error() error {
+	err := "Collected errors:\n"
+	for i, e := range *c {
+		err += fmt.Sprintf("\tError %d: %s\n", i, e.Error())
+	}
+	return errors.New(err)
+}
+
 type firehoseResponse struct {
 	RequestId    string `json:"requestId"`
 	Timestamp    int64  `json:"timestamp"`
@@ -185,6 +201,7 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	metricCount := 0
 	dataPointCount := 0
+	shippingErrors := new(ErrorCollector)
 	ListenerUrl := ""
 	// extract parameters
 	var ca map[string]interface{}
@@ -313,6 +330,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		err = metricsExporter.PushMetrics(ctx, metricsToSend)
 		if err != nil {
 			log.Printf("Error while sending metrics: %s", err)
+			shippingErrors.Collect(err)
 		} else {
 			numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()
 			metricCount += numberOfMetrics
@@ -326,6 +344,8 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		log.Printf("Error while shutting down exporter: %s", err)
 		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), err
 	}
-
+	if shippingErrors.Length() > 0 {
+		return generateValidFirehoseResponse(500, requestId, "Error while sending metrics:", shippingErrors.Error()), shippingErrors.Error()
+	}
 	return generateValidFirehoseResponse(200, requestId, "", nil), nil
 }
