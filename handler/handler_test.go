@@ -74,7 +74,7 @@ func TestHandleRequestErrors(t *testing.T) {
 	var getListenerUrlTests = []getListenerUrlTest{
 		{"noValidToken", 500},
 		{"noToken", 400},
-		{"malformedBody", 500},
+		{"malformedBody", 400},
 		{"simpleevent", 400},
 	}
 	for _, test := range getListenerUrlTests {
