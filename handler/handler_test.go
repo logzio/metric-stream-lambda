@@ -76,6 +76,7 @@ func TestHandleRequestErrors(t *testing.T) {
 		{"noToken", 400},
 		{"malformedBody", 400},
 		{"simpleevent", 400},
+		{"kinesisDemoData", 200},
 	}
 	for _, test := range getListenerUrlTests {
 		jsonFile, err := os.Open(fmt.Sprintf("../testdata/%s.json", test.file))

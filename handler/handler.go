@@ -97,6 +97,14 @@ func base64Decode(str string) (string, bool) {
 	return string(data), false
 }
 
+// isDemoData checks if the payload is kinesis demo data
+func isDemoData(rawData string) bool {
+	if strings.Contains(rawData, "TICKER_SYMBOL") && strings.Contains(rawData, "SECTOR") && strings.Contains(rawData, "CHANGE") {
+		return true
+	}
+	return false
+}
+
 // Generates logzio listener url based on aws region
 func getListenerUrl() string {
 	var url string
@@ -296,6 +304,9 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		data := record.(map[string]interface{})["data"].(string)
 		//Decoding data and convert to otlp proto message
 		rawDecodedText, _ := base64Decode(data)
+		if isDemoData(rawDecodedText) {
+			continue
+		}
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
 		ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 		err = protoBuffer.DecodeMessage(ExportMetricsServiceRequest)
