@@ -57,7 +57,7 @@ func generateValidFirehoseResponse(statusCode int, requestId string, errorMessag
 		data := firehoseResponse{
 			RequestId:    requestId,
 			Timestamp:    time.Now().Unix(),
-			ErrorMessage: fmt.Sprintf("%s %s", errorMessage, err),
+			ErrorMessage: fmt.Sprintf("%s %s", errorMessage, err.Error()),
 		}
 		jsonData, _ := json.Marshal(data)
 		return events.APIGatewayProxyResponse{
@@ -71,8 +71,9 @@ func generateValidFirehoseResponse(statusCode int, requestId string, errorMessag
 		}
 	} else {
 		data := firehoseResponse{
-			RequestId: requestId,
-			Timestamp: time.Now().Unix(),
+			RequestId:    requestId,
+			Timestamp:    time.Now().Unix(),
+			ErrorMessage: "",
 		}
 		jsonData, _ := json.Marshal(data)
 		return events.APIGatewayProxyResponse{
@@ -94,6 +95,14 @@ func base64Decode(str string) (string, bool) {
 		return "", true
 	}
 	return string(data), false
+}
+
+// isDemoData checks if the payload is kinesis demo data
+func isDemoData(rawData string) bool {
+	if strings.Contains(rawData, "TICKER_SYMBOL") && strings.Contains(rawData, "SECTOR") && strings.Contains(rawData, "CHANGE") {
+		return true
+	}
+	return false
 }
 
 // Generates logzio listener url based on aws region
@@ -177,7 +186,7 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 		maxDp.SetValue(datapoint.QuantileValues().At(datapoint.QuantileValues().Len() - 1).Value())
 		maxDp.SetTimestamp(datapoint.Timestamp())
 		addLabelsAndResourceAttributes(datapoint, maxDp, resourceAttributes)
-		// If the count value is greater than 1 and we have more than 2 Quantiles we need to add datapoints for each quantileValues
+		// If the count value is greater than 1, and we have more than 2 Quantiles we need to add datapoints for each quantileValues
 		if datapoint.Count() > 1 && datapoint.QuantileValues().Len() > 2 && datapoint.Sum() > 0 {
 			for i := 1; i < datapoint.QuantileValues().Len()-1; i++ {
 				quantileDp := quantileMetric.DoubleSum().DataPoints().AppendEmpty()
@@ -231,10 +240,9 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	}
 
 	if LogzioToken == "" {
-		message := "cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers"
-		err := errors.New(message)
-		log.Printf(message)
-		return generateValidFirehoseResponse(400, requestId, message, err), err
+		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
+		log.Println(err)
+		return generateValidFirehoseResponse(400, requestId, "Error while getting access keys:", accessKeyErr), nil
 	}
 
 	// Initializing prometheus remote write exporter
@@ -261,19 +269,19 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	metricsExporter, err := prometheusremotewriteexporter.NewPRWExporter(cfg, buildInfo)
 	if err != nil {
 		log.Printf("Error while creating metrics exporter: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while creating metrics exporter:", err), err
+		return generateValidFirehoseResponse(500, requestId, "Error while creating metrics exporter:", err), nil
 	}
 	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
 	if err != nil {
 		log.Printf("Error while starting metrics exporter: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while starting metrics exporter:", err), err
+		return generateValidFirehoseResponse(500, requestId, "Error while starting metrics exporter:", err), nil
 	}
 	log.Println("Starting to parse request body")
 	var body map[string]interface{}
 	err = json.Unmarshal([]byte(request.Body), &body)
 	if err != nil {
 		log.Printf("Error while unmarshalling request body: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while unmarshalling request body:", err), err
+		return generateValidFirehoseResponse(500, requestId, "Error while unmarshalling request body:", err), nil
 	}
 	/*
 		api request body example structure:
@@ -296,18 +304,21 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		data := record.(map[string]interface{})["data"].(string)
 		//Decoding data and convert to otlp proto message
 		rawDecodedText, _ := base64Decode(data)
+		if isDemoData(rawDecodedText) {
+			continue
+		}
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
 		ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 		err = protoBuffer.DecodeMessage(ExportMetricsServiceRequest)
 		if err != nil {
-			log.Printf("Error decoding data: %s", err)
-			return generateValidFirehoseResponse(500, requestId, "Error decoding data:", err), err
+			log.Printf("Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message: %s", err)
+			return generateValidFirehoseResponse(400, requestId, "Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message:", err), nil
 		}
 		// Converting otlp proto message to proto bytes
 		protoBytes, err := proto.Marshal(ExportMetricsServiceRequest)
 		if err != nil {
 			log.Printf("Error while converting otlp proto message to proto bytes: %s", err)
-			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), err
+			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
 		}
 		// Converting otlp proto bytes to pdata.metrics
 		metrics, err := pdata.MetricsFromOtlpProtoBytes(protoBytes)
@@ -342,10 +353,10 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
 		log.Printf("Error while shutting down exporter: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), err
+		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
-		return generateValidFirehoseResponse(500, requestId, "Error while sending metrics:", shippingErrors.Error()), shippingErrors.Error()
+		return generateValidFirehoseResponse(500, requestId, "Error while sending metrics:", shippingErrors.Error()), nil
 	}
 	return generateValidFirehoseResponse(200, requestId, "", nil), nil
 }
