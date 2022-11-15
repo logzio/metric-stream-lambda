@@ -118,6 +118,8 @@ func getListenerUrl() string {
 		url = "https://listener-eu.logz.io:8053"
 	case "eu-west-2":
 		url = "https://listener-uk.logz.io:8053"
+	case "ap-southeast-2":
+		url = "https://listener-au.logz.io:8053"
 	default:
 		log.Printf("Region '%s' is not supported yet, setting url to default value", awsRegion)
 		url = "https://listener.logz.io:8053"

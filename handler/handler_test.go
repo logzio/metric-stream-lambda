@@ -131,6 +131,7 @@ func TestGetListenerUrl(t *testing.T) {
 		{"ca-central-1", "https://listener-ca.logz.io:8053"},
 		{"eu-central-1", "https://listener-eu.logz.io:8053"},
 		{"eu-west-2", "https://listener-uk.logz.io:8053"},
+		{"ap-southeast-2", "https://listener-au.logz.io:8053"},
 		{"", "https://listener.logz.io:8053"},
 		{"not-valid", "https://listener.logz.io:8053"},
 	}
