@@ -168,32 +168,54 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 	quantileMetric := createMetricFromAttributes(metric, "")
 	for d := 0; d < dps.Len(); d++ {
 		datapoint := dps.At(d)
+		namespace, _ := datapoint.LabelsMap().Get("Namespace")
+		setTimestampNow := namespace == "AWS/S3"
 		// Sum datapoint
 		sumDp := sumMetric.DoubleSum().DataPoints().AppendEmpty()
 		sumDp.SetValue(datapoint.Sum())
-		sumDp.SetTimestamp(datapoint.Timestamp())
+		if setTimestampNow {
+			sumDp.SetTimestamp(pdata.TimestampFromTime(time.Now()))
+		} else {
+			sumDp.SetTimestamp(datapoint.Timestamp())
+		}
 		addLabelsAndResourceAttributes(datapoint, sumDp, resourceAttributes)
 		// Count datapoint
 		countDp := countMetric.DoubleSum().DataPoints().AppendEmpty()
 		countDp.SetValue(float64(datapoint.Count()))
-		countDp.SetTimestamp(datapoint.Timestamp())
+		if setTimestampNow {
+			countDp.SetTimestamp(pdata.TimestampFromTime(time.Now()))
+		} else {
+			countDp.SetTimestamp(datapoint.Timestamp())
+		}
 		addLabelsAndResourceAttributes(datapoint, countDp, resourceAttributes)
 		// Min datapoint
 		minDp := minMetric.DoubleSum().DataPoints().AppendEmpty()
 		minDp.SetValue(datapoint.QuantileValues().At(0).Value())
-		minDp.SetTimestamp(datapoint.Timestamp())
+		if setTimestampNow {
+			minDp.SetTimestamp(pdata.TimestampFromTime(time.Now()))
+		} else {
+			minDp.SetTimestamp(datapoint.Timestamp())
+		}
 		addLabelsAndResourceAttributes(datapoint, minDp, resourceAttributes)
 		// Max datapoint
 		maxDp := maxMetric.DoubleSum().DataPoints().AppendEmpty()
 		maxDp.SetValue(datapoint.QuantileValues().At(datapoint.QuantileValues().Len() - 1).Value())
-		maxDp.SetTimestamp(datapoint.Timestamp())
+		if setTimestampNow {
+			maxDp.SetTimestamp(pdata.TimestampFromTime(time.Now()))
+		} else {
+			maxDp.SetTimestamp(datapoint.Timestamp())
+		}
 		addLabelsAndResourceAttributes(datapoint, maxDp, resourceAttributes)
 		// If the count value is greater than 1, and we have more than 2 Quantiles we need to add datapoints for each quantileValues
 		if datapoint.Count() > 1 && datapoint.QuantileValues().Len() > 2 && datapoint.Sum() > 0 {
 			for i := 1; i < datapoint.QuantileValues().Len()-1; i++ {
 				quantileDp := quantileMetric.DoubleSum().DataPoints().AppendEmpty()
 				quantileDp.SetValue(datapoint.QuantileValues().At(i).Value())
-				quantileDp.SetTimestamp(datapoint.Timestamp())
+				if setTimestampNow {
+					quantileDp.SetTimestamp(pdata.TimestampFromTime(time.Now()))
+				} else {
+					quantileDp.SetTimestamp(datapoint.Timestamp())
+				}
 				quantileDp.LabelsMap().Insert("quantile", fmt.Sprintf("%v", datapoint.QuantileValues().At(i).Quantile()))
 				addLabelsAndResourceAttributes(datapoint, quantileDp, resourceAttributes)
 			}
