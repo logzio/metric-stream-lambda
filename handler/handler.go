@@ -122,7 +122,7 @@ func isDemoData(rawData string) bool {
 }
 
 // Generates logzio listener url based on aws region
-func getListenerUrl() string {
+func getListenerUrl(log zap.SugaredLogger) string {
 	var url string
 	// reserved lambda environment variable AWS_REGION https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
 	switch awsRegion := os.Getenv("AWS_REGION"); awsRegion {
@@ -137,10 +137,10 @@ func getListenerUrl() string {
 	case "ap-southeast-2":
 		url = "https://listener-au.logz.io:8053"
 	default:
-		log.Printf("Region '%s' is not supported yet, setting url to default value", awsRegion)
+		log.Infof("Region '%s' is not supported yet, setting url to default value", awsRegion)
 		url = "https://listener.logz.io:8053"
 	}
-	log.Printf("Setting logzio listener url to: %s", url)
+	log.Infof("Setting logzio listener url to: %s", url)
 	return url
 }
 
@@ -256,12 +256,14 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.
 	//}
 	lambdaContext, _ := lambdacontext.FromContext(ctx)
 	awsAccount := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":")[4]
+	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	config := zap.NewProductionConfig()
 	config.EncoderConfig.TimeKey = "timestamp"
 	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
 	config.InitialFields = map[string]interface{}{
-		"aws_account":      awsAccount,
-		"lambda_requestID": lambdaContext.AwsRequestID,
+		"aws_account":          awsAccount,
+		"lambda_invocation_id": lambdaContext.AwsRequestID,
+		"firehose_request_id":  firehoseRequestId,
 	}
 	logger, configErr := config.Build()
 	if configErr != nil {
@@ -302,7 +304,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		Namespace:      "",
 		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-cloudwatch-stream-metrics"},
 		HTTPClientSettings: confighttp.HTTPClientSettings{
-			Endpoint: getListenerUrl(),
+			Endpoint: getListenerUrl(log),
 			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LogzioToken)},
 		},
 	}
