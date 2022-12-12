@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/golang/protobuf/proto"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
@@ -17,6 +18,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
 	_ "go.opentelemetry.io/otel/metric"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	"go.uber.org/zap"
 	"log"
 	"os"
 	"strings"
@@ -29,6 +31,8 @@ const (
 	minStr   = "_min"
 	maxStr   = "_max"
 )
+
+var detectedNamespaces []string
 
 type ErrorCollector []error
 
@@ -95,6 +99,18 @@ func base64Decode(str string) (string, bool) {
 		return "", true
 	}
 	return string(data), false
+}
+
+func removeDuplicateValues(intSlice []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+	for _, entry := range intSlice {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
 }
 
 // isDemoData checks if the payload is kinesis demo data
@@ -169,6 +185,7 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 	for d := 0; d < dps.Len(); d++ {
 		datapoint := dps.At(d)
 		namespace, _ := datapoint.LabelsMap().Get("Namespace")
+		detectedNamespaces = append(detectedNamespaces, namespace)
 		setTimestampNow := namespace == "AWS/S3"
 		// Sum datapoint
 		sumDp := sumMetric.DoubleSum().DataPoints().AppendEmpty()
@@ -230,42 +247,47 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 		quantileMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
 	}
 }
+func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.SugaredLogger {
+	// TODO extract parameters and add to initial fields
+	//var ca map[string]interface{}
+	//err := json.Unmarshal([]byte(request.Headers["x-amz-firehose-common-attributes"]), &ca)
+	//if ca == nil {
+	//	json.Unmarshal([]byte(request.Headers["X-Amz-Firehose-Common-Attributes"]), &ca)
+	//}
+	lambdaContext, _ := lambdacontext.FromContext(ctx)
+	awsAccount := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":")[4]
+	config := zap.NewProductionConfig()
+	config.EncoderConfig.TimeKey = "timestamp"
+	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
+	config.InitialFields = map[string]interface{}{
+		"aws_account":      awsAccount,
+		"lambda_requestID": lambdaContext.AwsRequestID,
+	}
+	logger, configErr := config.Build()
+	if configErr != nil {
+		log.Fatal(configErr)
+	}
+	return *logger.Sugar()
+}
 
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	log := initLogger(ctx, request)
 	metricCount := 0
 	dataPointCount := 0
 	shippingErrors := new(ErrorCollector)
-	ListenerUrl := ""
-	// extract parameters
-	var ca map[string]interface{}
-	err := json.Unmarshal([]byte(request.Headers["x-amz-firehose-common-attributes"]), &ca)
-	if ca == nil {
-		json.Unmarshal([]byte(request.Headers["X-Amz-Firehose-Common-Attributes"]), &ca)
-	}
-	if ca != nil {
-		parameterMap := ca["commonAttributes"].(map[string]interface{})
-		if parameterMap != nil {
-			ListenerUrl = parameterMap["CUSTOM_LISTENER"].(string)
-		}
-	}
-	if ListenerUrl == "" {
-		ListenerUrl = getListenerUrl()
-	}
-
-	log.Println("Getting access key from headers")
-	LogzioToken := request.Headers["X-Amz-Firehose-Access-Key"]
-	if LogzioToken == "" {
-		LogzioToken = request.Headers["x-amz-firehose-access-key"]
-	}
+	log.Infof("Getting access key from headers")
 	// get requestId to match firehose response requirements
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	if requestId == "" {
 		requestId = request.Headers["x-amz-firehose-request-id"]
 	}
-
+	LogzioToken := request.Headers["X-Amz-Firehose-Access-Key"]
+	if LogzioToken == "" {
+		LogzioToken = request.Headers["x-amz-firehose-access-key"]
+	}
 	if LogzioToken == "" {
 		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
-		log.Println(err)
+		log.Error(accessKeyErr)
 		return generateValidFirehoseResponse(400, requestId, "Error while getting access keys:", accessKeyErr), nil
 	}
 
@@ -280,7 +302,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		Namespace:      "",
 		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-cloudwatch-stream-metrics"},
 		HTTPClientSettings: confighttp.HTTPClientSettings{
-			Endpoint: ListenerUrl,
+			Endpoint: getListenerUrl(),
 			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LogzioToken)},
 		},
 	}
@@ -289,22 +311,22 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		Description: "OpenTelemetry",
 		Version:     "0.7",
 	}
-	log.Println("Starting metrics exporter")
+	log.Info("Starting metrics exporter")
 	metricsExporter, err := prometheusremotewriteexporter.NewPRWExporter(cfg, buildInfo)
 	if err != nil {
-		log.Printf("Error while creating metrics exporter: %s", err)
+		log.Infof("Error while creating metrics exporter: %s", err)
 		return generateValidFirehoseResponse(500, requestId, "Error while creating metrics exporter:", err), nil
 	}
 	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
 	if err != nil {
-		log.Printf("Error while starting metrics exporter: %s", err)
+		log.Infof("Error while starting metrics exporter: %s", err)
 		return generateValidFirehoseResponse(500, requestId, "Error while starting metrics exporter:", err), nil
 	}
-	log.Println("Starting to parse request body")
+	log.Info("Starting to parse request body")
 	var body map[string]interface{}
 	err = json.Unmarshal([]byte(request.Body), &body)
 	if err != nil {
-		log.Printf("Error while unmarshalling request body: %s", err)
+		log.Infof("Error while unmarshalling request body: %s", err)
 		return generateValidFirehoseResponse(500, requestId, "Error while unmarshalling request body:", err), nil
 	}
 	/*
@@ -335,13 +357,13 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 		err = protoBuffer.DecodeMessage(ExportMetricsServiceRequest)
 		if err != nil {
-			log.Printf("Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message: %s", err)
+			log.Warnf("Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message: %s", err)
 			return generateValidFirehoseResponse(400, requestId, "Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message:", err), nil
 		}
 		// Converting otlp proto message to proto bytes
 		protoBytes, err := proto.Marshal(ExportMetricsServiceRequest)
 		if err != nil {
-			log.Printf("Error while converting otlp proto message to proto bytes: %s", err)
+			log.Warnf("Error while converting otlp proto message to proto bytes: %s", err)
 			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
 		}
 		// Converting otlp proto bytes to pdata.metrics
@@ -361,10 +383,10 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 				}
 			}
 		}
-		log.Printf("Sending metrics, Bulk number: %d", bulkNum)
+		log.Infof("Sending metrics, Bulk number: %d", bulkNum)
 		err = metricsExporter.PushMetrics(ctx, metricsToSend)
 		if err != nil {
-			log.Printf("Error while sending metrics: %s", err)
+			log.Warnf("Error while sending metrics: %s", err)
 			shippingErrors.Collect(err)
 		} else {
 			numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()
@@ -372,11 +394,11 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			dataPointCount += numberOfDataPoints
 		}
 	}
-	log.Printf("Found total of %d metrics with %d datapoints", metricCount, dataPointCount)
-	log.Println("Shutting down metrics exporter")
+	log.Infof("Found total of %d metrics with %d datapoints from the following namespaces %s", metricCount, dataPointCount, removeDuplicateValues(detectedNamespaces))
+	log.Info("Shutting down metrics exporter")
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
-		log.Printf("Error while shutting down exporter: %s", err)
+		log.Warnf("Error while shutting down exporter: %s", err)
 		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
