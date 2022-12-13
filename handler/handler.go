@@ -2,8 +2,7 @@ package handler
 
 import (
 	"context"
-	_ "context"
-	base64 "encoding/base64"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,13 +12,12 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
-	pdata "go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/consumer/pdata"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
-	_ "go.opentelemetry.io/otel/metric"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"go.uber.org/zap"
-	"log"
+	logold "log"
 	"os"
 	"strings"
 	"time"
@@ -41,7 +39,6 @@ func (c *ErrorCollector) Collect(e error) { *c = append(*c, e) }
 func (c *ErrorCollector) Length() int {
 	return len(*c)
 }
-
 func (c *ErrorCollector) Error() error {
 	err := "Collected errors:\n"
 	for i, e := range *c {
@@ -90,6 +87,31 @@ func generateValidFirehoseResponse(statusCode int, requestId string, errorMessag
 			MultiValueHeaders: map[string][]string{},
 		}
 	}
+}
+func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.SugaredLogger {
+	awsRequestId := ""
+	account := ""
+	lambdaContext, ok := lambdacontext.FromContext(ctx)
+	if ok {
+		awsRequestId = lambdaContext.AwsRequestID
+	}
+	awsAccount := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":")
+	if len(awsAccount) > 4 {
+		account = awsAccount[4]
+	}
+	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
+	config := zap.NewProductionConfig()
+	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
+	config.InitialFields = map[string]interface{}{
+		"aws_account":          account,
+		"lambda_invocation_id": awsRequestId,
+		"firehose_request_id":  firehoseRequestId,
+	}
+	logger, configErr := config.Build()
+	if configErr != nil {
+		logold.Fatal(configErr)
+	}
+	return *logger.Sugar()
 }
 
 // Takes a base64 encoded string and returns decoded string
@@ -247,31 +269,6 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 		quantileMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
 	}
 }
-func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.SugaredLogger {
-	// TODO extract parameters and add to initial fields
-	//var ca map[string]interface{}
-	//err := json.Unmarshal([]byte(request.Headers["x-amz-firehose-common-attributes"]), &ca)
-	//if ca == nil {
-	//	json.Unmarshal([]byte(request.Headers["X-Amz-Firehose-Common-Attributes"]), &ca)
-	//}
-	lambdaContext, _ := lambdacontext.FromContext(ctx)
-	awsAccount := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":")[4]
-	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
-	config := zap.NewProductionConfig()
-	config.EncoderConfig.TimeKey = "timestamp"
-	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
-	config.InitialFields = map[string]interface{}{
-		"aws_account":          awsAccount,
-		"lambda_invocation_id": lambdaContext.AwsRequestID,
-		"firehose_request_id":  firehoseRequestId,
-	}
-	logger, configErr := config.Build()
-	if configErr != nil {
-		log.Fatal(configErr)
-	}
-	return *logger.Sugar()
-}
-
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	log := initLogger(ctx, request)
 	metricCount := 0

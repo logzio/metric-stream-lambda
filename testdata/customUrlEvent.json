@@ -12,6 +12,7 @@
     "X-Forwarded-For": "5.102.247.60",
     "X-Forwarded-Port": "443",
     "X-Forwarded-Proto": "https",
+    "X-Amz-Firehose-Source-Arn": "arn:aws:firehose:us-east-1:123456789:deliverystream/testStream",
     "X-Amz-Firehose-Access-Key": "token",
     "accept": "*/*",
     "accept-encoding": "gzip, deflate, br",
