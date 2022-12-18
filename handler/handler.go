@@ -122,7 +122,6 @@ func base64Decode(str string) (string, bool) {
 	}
 	return string(data), false
 }
-
 func removeDuplicateValues(intSlice []string) []string {
 	keys := make(map[string]bool)
 	var list []string

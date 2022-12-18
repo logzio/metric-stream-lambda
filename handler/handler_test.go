@@ -148,6 +148,36 @@ func TestGetListenerUrl(t *testing.T) {
 		require.Equal(t, output, test.expected)
 	}
 }
+func TestRemoveDuplicateValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		intSlice []string
+		expected []string
+	}{
+		{
+			name:     "no duplicates",
+			intSlice: []string{"a", "b", "c"},
+			expected: []string{"a", "b", "c"},
+		},
+		{
+			name:     "all duplicates",
+			intSlice: []string{"a", "a", "a"},
+			expected: []string{"a"},
+		},
+		{
+			name:     "some duplicates",
+			intSlice: []string{"a", "b", "c", "a", "b"},
+			expected: []string{"a", "b", "c"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := removeDuplicateValues(test.intSlice)
+			assert.Equal(t, result, test.expected, "Expected %v, got %v", test.expected, result)
+		})
+	}
+}
 
 func TestSummaryValuesToMetrics(t *testing.T) {
 	testMetric := pdata.NewMetric()
