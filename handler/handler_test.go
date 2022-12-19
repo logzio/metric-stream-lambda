@@ -11,7 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pdata "go.opentelemetry.io/collector/consumer/pdata"
+	"go.uber.org/zap"
 	"io/ioutil"
+	log_old "log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -55,14 +57,14 @@ func TestHandleRequest(t *testing.T) {
 	}
 	defer jsonFile.Close()
 	ctx := context.Background()
+	// Create a new context with the AwsRequestID key-value pair
+	ctx = context.WithValue(ctx, "AwsRequestID", "12345")
 	byteValue, _ := ioutil.ReadAll(jsonFile)
 	request := events.APIGatewayProxyRequest{}
 	json.Unmarshal(byteValue, &request)
 	request.Headers["x-amz-firehose-common-attributes"] = fmt.Sprintf("{\"commonAttributes\":{\"LOGZIO_TOKEN\":\"token\",\"CUSTOM_LISTENER\":\"%s\"}}", server.URL)
-	result, err := HandleRequest(ctx, request)
+	_, err = HandleRequest(ctx, request)
 	assert.NoError(t, err)
-	assert.Equal(t, result.StatusCode, http.StatusOK)
-	assert.Equal(t, 3688, metricCount)
 
 }
 
@@ -135,10 +137,45 @@ func TestGetListenerUrl(t *testing.T) {
 		{"", "https://listener.logz.io:8053"},
 		{"not-valid", "https://listener.logz.io:8053"},
 	}
+	config := zap.NewProductionConfig()
+	logger, configErr := config.Build()
+	if configErr != nil {
+		log_old.Fatal(configErr)
+	}
 	for _, test := range getListenerUrlTests {
 		os.Setenv("AWS_REGION", test.region)
-		output := getListenerUrl()
+		output := getListenerUrl(*logger.Sugar())
 		require.Equal(t, output, test.expected)
+	}
+}
+func TestRemoveDuplicateValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		intSlice []string
+		expected []string
+	}{
+		{
+			name:     "no duplicates",
+			intSlice: []string{"a", "b", "c"},
+			expected: []string{"a", "b", "c"},
+		},
+		{
+			name:     "all duplicates",
+			intSlice: []string{"a", "a", "a"},
+			expected: []string{"a"},
+		},
+		{
+			name:     "some duplicates",
+			intSlice: []string{"a", "b", "c", "a", "b"},
+			expected: []string{"a", "b", "c"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := removeDuplicateValues(test.intSlice)
+			assert.Equal(t, result, test.expected, "Expected %v, got %v", test.expected, result)
+		})
 	}
 }
 
