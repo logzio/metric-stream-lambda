@@ -101,6 +101,7 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.
 	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	config := zap.NewProductionConfig()
 	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
+	config.OutputPaths = []string{"stdout"} // write to stdout
 	config.InitialFields = map[string]interface{}{
 		"aws_account":          account,
 		"lambda_invocation_id": awsRequestId,
@@ -251,13 +252,7 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	log := initLogger(ctx, request)
 	// flush buffered logs if exists, before the function run ends
-	defer func(log *zap.SugaredLogger) {
-		log.Infof("Syncing logger and finishing function run")
-		err := log.Sync()
-		if err != nil {
-			log.Errorf("Error while logger sync: %v", err)
-		}
-	}(&log)
+	defer log.Sync()
 	metricCount := 0
 	dataPointCount := 0
 	shippingErrors := new(ErrorCollector)
