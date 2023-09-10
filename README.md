@@ -20,3 +20,16 @@ This function has the following limitations:
 
 - It can only process metrics data in OTLP 0.7 format.
 - It can only forward the data to a Prometheus Remote Write endpoint.
+
+### Changelog
+
+- v1.0.2
+  - Stop trying to send bulks if encountered 401 status code
+  - Add logzio identifier to each log (5 last chars of the shipping token)
+  - Add zip workflow and artifact
+- v1.0.1
+  - Improved logging (Add `zap` logger)
+  - Add metadata (AWS account, firehose request id, lambda invocation id) to each log for context
+  - Flush buffered logs if exists, before the function run ends
+- v1.0.0
+  - Initial release: Lambda function that receives OTLP (0.7.0) data from AWS metric stream and exports the data to logz.io using Prometheus remote write
