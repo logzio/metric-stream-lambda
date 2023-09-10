@@ -87,9 +87,10 @@ func generateValidFirehoseResponse(statusCode int, requestId string, errorMessag
 		}
 	}
 }
-func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.SugaredLogger {
+func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) zap.SugaredLogger {
 	awsRequestId := ""
 	account := ""
+	logzioIdentifier := ""
 	lambdaContext, ok := lambdacontext.FromContext(ctx)
 	if ok {
 		awsRequestId = lambdaContext.AwsRequestID
@@ -98,14 +99,18 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest) zap.
 	if len(awsAccount) > 4 {
 		account = awsAccount[4]
 	}
+	if len(token) >= 5 {
+		logzioIdentifier = token[len(token)-5:]
+	}
 	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	config := zap.NewProductionConfig()
 	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
 	config.OutputPaths = []string{"stdout"} // write to stdout
 	config.InitialFields = map[string]interface{}{
-		"aws_account":          account,
-		"lambda_invocation_id": awsRequestId,
-		"firehose_request_id":  firehoseRequestId,
+		"aws_account":               account,
+		"lambda_invocation_id":      awsRequestId,
+		"firehose_request_id":       firehoseRequestId,
+		"logzio_account_identifier": logzioIdentifier,
 	}
 	logger, configErr := config.Build()
 	if configErr != nil {
@@ -250,13 +255,9 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 	}
 }
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	log := initLogger(ctx, request)
-	// flush buffered logs if exists, before the function run ends
-	defer log.Sync()
 	metricCount := 0
 	dataPointCount := 0
 	shippingErrors := new(ErrorCollector)
-	log.Infof("Getting access key from headers")
 	// get requestId to match firehose response requirements
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	if requestId == "" {
@@ -266,6 +267,9 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	if LogzioToken == "" {
 		LogzioToken = request.Headers["x-amz-firehose-access-key"]
 	}
+	log := initLogger(ctx, request, LogzioToken)
+	// flush buffered logs if exists, before the function run ends
+	defer log.Sync()
 	if LogzioToken == "" {
 		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
 		log.Error(accessKeyErr)
@@ -368,6 +372,9 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		err = metricsExporter.PushMetrics(ctx, metricsToSend)
 		if err != nil {
 			log.Warnf("Error while sending metrics: %s", err)
+			if strings.Contains(err.Error(), "status 401") {
+				return generateValidFirehoseResponse(400, requestId, "Error while sending metrics:", err), nil
+			}
 			shippingErrors.Collect(err)
 		} else {
 			numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()

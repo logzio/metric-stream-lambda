@@ -1,0 +1,24 @@
+name: Upload release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.17
+      - name: Build function
+        run: make function
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        with:
+          asset_path: ./function.zip
+          asset_name: function.zip
+          asset_content_type: application/zip
