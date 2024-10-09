@@ -9,24 +9,31 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/golang/protobuf/proto"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
-	"go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configtelemetry"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/sdk/trace"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"os"
 	"strings"
 	"time"
 )
 
 const (
-	sumStr   = "_sum"
-	countStr = "_count"
-	minStr   = "_min"
-	maxStr   = "_max"
+	minStr = "_min"
+	maxStr = "_max"
 )
 
 var detectedNamespaces []string
@@ -87,7 +94,7 @@ func generateValidFirehoseResponse(statusCode int, requestId string, errorMessag
 		}
 	}
 }
-func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) zap.SugaredLogger {
+func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) *zap.Logger {
 	awsRequestId := ""
 	account := ""
 	logzioIdentifier := ""
@@ -117,7 +124,7 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, toke
 		fmt.Printf("Error while initializing the logger: %v", configErr)
 		panic(configErr)
 	}
-	return *logger.Sugar()
+	return logger
 }
 
 // Takes a base64 encoded string and returns decoded string
@@ -149,7 +156,7 @@ func isDemoData(rawData string) bool {
 }
 
 // Generates logzio listener url based on aws region
-func getListenerUrl(log zap.SugaredLogger) string {
+func getListenerUrl(log zap.Logger) string {
 	var url string
 	// reserved lambda environment variable AWS_REGION https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
 	switch awsRegion := os.Getenv("AWS_REGION"); awsRegion {
@@ -164,96 +171,45 @@ func getListenerUrl(log zap.SugaredLogger) string {
 	case "ap-southeast-2":
 		url = "https://listener-au.logz.io:8053"
 	default:
-		log.Infof("Region '%s' is not supported yet, setting url to default value", awsRegion)
+		log.Info("Region is not supported yet, setting url to default value", zap.Field{Key: "region", Type: zapcore.StringType, String: awsRegion})
 		url = "https://listener.logz.io:8053"
 	}
-	log.Infof("Setting logzio listener url to: %s", url)
+	log.Info("Setting logzio listener", zap.Field{Key: "url", Type: zapcore.StringType, String: url})
 	return url
 }
 
-// Takes origin metric and suffix based on desired aggregation. Creates new DoubleSum metric with origin name plus suffix, origin unit and origin description
-func createMetricFromAttributes(metric pdata.Metric, suffix string) pdata.Metric {
-	destMetric := pdata.NewMetric()
-	destMetric.SetName(metric.Name() + suffix)
-	destMetric.SetDataType(pdata.MetricDataTypeDoubleSum)
-	destMetric.SetUnit(metric.Unit())
-	destMetric.SetDescription(metric.Description())
-	destMetric.DoubleSum().SetAggregationTemporality(pdata.AggregationTemporalityCumulative)
-	return destMetric
-}
-
-// Takes origin datapoint, destination datapoint and resource attributes. Coping labels from origin and adding resource attributes as labels
-func addLabelsAndResourceAttributes(dp pdata.SummaryDataPoint, destDp pdata.DoubleDataPoint, resourceAttributes pdata.AttributeMap) {
-	dp.LabelsMap().Range(func(k string, v string) bool {
-		destDp.LabelsMap().Insert(strings.ToLower(k), strings.ToLower(v))
-		return true
-	})
-	accountId, _ := resourceAttributes.Get("cloud.account.id")
-	region, _ := resourceAttributes.Get("cloud.region")
-	destDp.LabelsMap().Insert("account", accountId.StringVal())
-	destDp.LabelsMap().Insert("region", region.StringVal())
-}
-
-// Takes Summary metric and generates new metrics (sum, count, min, max) than add them to metricsToSend
-func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetricsSlice, metric pdata.Metric, resourceAttributes pdata.AttributeMap) {
-	// Converts to new name (example: amazonaws.com/AWS/AppRunner/ActiveInstances -> aws_apprunner_activeinstances)
-	newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(metric.Name(), "/", "_")), "amazonaws.com_", "")
-	metric.SetName(newName)
-	// Assuming Summary metric type according to AWS docs:
-	// https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/acw-ug.pdf#CloudWatch-metric-streams-formats-opentelemetry
-	// Page 262
-	var dps = metric.Summary().DataPoints()
-	// Generate new metrics (sum, count, min, max), and for each summary data point, lowercase all attributes and add resource attributes
-	sumMetric := createMetricFromAttributes(metric, sumStr)
-	countMetric := createMetricFromAttributes(metric, countStr)
-	maxMetric := createMetricFromAttributes(metric, maxStr)
-	minMetric := createMetricFromAttributes(metric, minStr)
-	quantileMetric := createMetricFromAttributes(metric, "")
-	for d := 0; d < dps.Len(); d++ {
-		datapoint := dps.At(d)
-		namespace, _ := datapoint.LabelsMap().Get("Namespace")
-		detectedNamespaces = append(detectedNamespaces, namespace)
-		// Sum datapoint
-		sumDp := sumMetric.DoubleSum().DataPoints().AppendEmpty()
-		sumDp.SetValue(datapoint.Sum())
-		sumDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, sumDp, resourceAttributes)
-		// Count datapoint
-		countDp := countMetric.DoubleSum().DataPoints().AppendEmpty()
-		countDp.SetValue(float64(datapoint.Count()))
-
-		countDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, countDp, resourceAttributes)
-		// Min datapoint
-		minDp := minMetric.DoubleSum().DataPoints().AppendEmpty()
-		minDp.SetValue(datapoint.QuantileValues().At(0).Value())
-		minDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, minDp, resourceAttributes)
-		// Max datapoint
-		maxDp := maxMetric.DoubleSum().DataPoints().AppendEmpty()
-		maxDp.SetValue(datapoint.QuantileValues().At(datapoint.QuantileValues().Len() - 1).Value())
-		maxDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, maxDp, resourceAttributes)
-		// If the count value is greater than 1, and we have more than 2 Quantiles we need to add datapoints for each quantileValues
-		if datapoint.Count() > 1 && datapoint.QuantileValues().Len() > 2 && datapoint.Sum() > 0 {
-			for i := 1; i < datapoint.QuantileValues().Len()-1; i++ {
-				quantileDp := quantileMetric.DoubleSum().DataPoints().AppendEmpty()
-				quantileDp.SetValue(datapoint.QuantileValues().At(i).Value())
-				quantileDp.SetTimestamp(datapoint.Timestamp())
-				quantileDp.LabelsMap().Insert("quantile", fmt.Sprintf("%v", datapoint.QuantileValues().At(i).Quantile()))
-				addLabelsAndResourceAttributes(datapoint, quantileDp, resourceAttributes)
+func updateMetricTimestamps(metrics pmetric.Metrics, log *zap.Logger) {
+	for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+		resourceMetrics := metrics.ResourceMetrics().At(i)
+		for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
+			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
+			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
+				m := scopeMetrics.Metrics().At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					for l := 0; l < m.Gauge().DataPoints().Len(); l++ {
+						m.Gauge().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+					}
+				case pmetric.MetricTypeSum:
+					for l := 0; l < m.Sum().DataPoints().Len(); l++ {
+						m.Sum().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+					}
+				case pmetric.MetricTypeHistogram:
+					for l := 0; l < m.Histogram().DataPoints().Len(); l++ {
+						m.Histogram().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+					}
+				case pmetric.MetricTypeSummary:
+					for l := 0; l < m.Summary().DataPoints().Len(); l++ {
+						m.Summary().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+					}
+				default:
+					log.Info("Unknown metric type", zap.Field{Key: "metric_type", Type: zapcore.StringType, String: m.Type().String()})
+				}
 			}
 		}
 	}
-	// Add new aggregated metrics to destination
-	sumMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	countMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	maxMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	minMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	if quantileMetric.DoubleSum().DataPoints().Len() > 0 {
-		quantileMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	}
 }
+
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	metricCount := 0
 	dataPointCount := 0
@@ -268,50 +224,68 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		LogzioToken = request.Headers["x-amz-firehose-access-key"]
 	}
 	log := initLogger(ctx, request, LogzioToken)
-	// flush buffered logs if exists, before the function run ends
 	defer log.Sync()
+
 	if LogzioToken == "" {
 		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
-		log.Error(accessKeyErr)
+		log.Error(accessKeyErr.Error())
 		return generateValidFirehoseResponse(400, requestId, "Error while getting access keys:", accessKeyErr), nil
 	}
-
 	// Initializing prometheus remote write exporter
 	cfg := &prometheusremotewriteexporter.Config{
-		TimeoutSettings: exporterhelper.TimeoutSettings{},
-		RetrySettings: exporterhelper.RetrySettings{
-			Enabled:         true,
-			InitialInterval: 500 * time.Millisecond,
-			MaxInterval:     1 * time.Second,
-		},
 		Namespace:      "",
-		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-cloudwatch-stream-metrics"},
-		HTTPClientSettings: confighttp.HTTPClientSettings{
-			Endpoint: getListenerUrl(log),
-			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LogzioToken)},
+		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-1"},
+		ClientConfig: confighttp.ClientConfig{
+			Endpoint: getListenerUrl(*log),
+			Headers:  map[string]configopaque.String{"Authorization": configopaque.String(fmt.Sprintf("Bearer %s", LogzioToken))},
 		},
+		ResourceToTelemetrySettings: resourcetotelemetry.Settings{
+			Enabled: true,
+		},
+		TargetInfo: &prometheusremotewriteexporter.TargetInfo{
+			Enabled: false,
+		},
+		CreatedMetric: &prometheusremotewriteexporter.CreatedMetric{
+			Enabled: false,
+		},
+		RemoteWriteQueue: prometheusremotewriteexporter.RemoteWriteQueue{
+			Enabled:      true,
+			NumConsumers: 3,
+			QueueSize:    1000,
+		},
+		MaxBatchSizeBytes: 3000000,
 	}
-	cfg.RemoteWriteQueue.NumConsumers = 3
-	buildInfo := component.BuildInfo{
-		Description: "OpenTelemetry",
-		Version:     "0.7",
+	settings := exporter.Settings{
+		TelemetrySettings: component.TelemetrySettings{
+			Logger:         log,
+			MetricsLevel:   configtelemetry.LevelNone,
+			TracerProvider: trace.NewTracerProvider(),
+			LeveledMeterProvider: func(level configtelemetry.Level) metric.MeterProvider {
+				return noop.NewMeterProvider()
+			},
+		},
+		BuildInfo: component.BuildInfo{
+			Description: "logzioMetricStream",
+			Version:     "1.0",
+		},
 	}
 	log.Info("Starting metrics exporter")
-	metricsExporter, err := prometheusremotewriteexporter.NewPRWExporter(cfg, buildInfo)
+	metricsExporter, err := prometheusremotewriteexporter.NewFactory().CreateMetricsExporter(context.Background(), settings, cfg)
 	if err != nil {
-		log.Infof("Error while creating metrics exporter: %s", err)
+		log.Info("Error while creating metrics exporter", zap.Error(err))
 		return generateValidFirehoseResponse(500, requestId, "Error while creating metrics exporter:", err), nil
 	}
 	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
 	if err != nil {
-		log.Infof("Error while starting metrics exporter: %s", err)
+		log.Info("Error while starting metrics exporter", zap.Error(err))
 		return generateValidFirehoseResponse(500, requestId, "Error while starting metrics exporter:", err), nil
 	}
+
 	log.Info("Starting to parse request body")
 	var body map[string]interface{}
 	err = json.Unmarshal([]byte(request.Body), &body)
 	if err != nil {
-		log.Infof("Error while unmarshalling request body: %s", err)
+		log.Info("Error while unmarshalling request body", zap.Error(err))
 		return generateValidFirehoseResponse(500, requestId, "Error while unmarshalling request body:", err), nil
 	}
 	/*
@@ -339,54 +313,122 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			continue
 		}
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
-		ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
-		err = protoBuffer.DecodeMessage(ExportMetricsServiceRequest)
+		protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
+		err = protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
 		if err != nil {
-			log.Warnf("Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message: %s", err)
+			log.Warn("Error decoding otlp proto message, make sure you are using opentelemetry 1.0 metrics format. Error message", zap.Error(err))
 			return generateValidFirehoseResponse(400, requestId, "Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message:", err), nil
 		}
-		// Converting otlp proto message to proto bytes
-		protoBytes, err := proto.Marshal(ExportMetricsServiceRequest)
-		if err != nil {
-			log.Warnf("Error while converting otlp proto message to proto bytes: %s", err)
+		protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
+		if marshalErr != nil {
 			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
 		}
-		// Converting otlp proto bytes to pdata.metrics
-		metrics, err := pdata.MetricsFromOtlpProtoBytes(protoBytes)
-		// represents the metrics to send after converting from summary to sum, count, min, max (those are the metrics we are actually going to send)
-		metricsToSend := pdata.NewMetrics()
-		aggregatedInstrumentationLibraryMetrics := metricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
-		// Lopping threw all metrics and data points, generate new metrics (sum, count, min, max) and enhance labels with logz.io naming conventions and resource attributes
-		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
-			resource := metrics.ResourceMetrics().At(i)
-			resourceAttributes := resource.Resource().Attributes()
-			for j := 0; j < resource.InstrumentationLibraryMetrics().Len(); j++ {
-				instrumentationLibraryMetrics := resource.InstrumentationLibraryMetrics().At(j)
-				for k := 0; k < instrumentationLibraryMetrics.Metrics().Len(); k++ {
-					metric := instrumentationLibraryMetrics.Metrics().At(k)
-					summaryValuesToMetrics(aggregatedInstrumentationLibraryMetrics, metric, resourceAttributes)
+		exportRequest := pmetricotlp.NewExportRequest()
+		err = exportRequest.UnmarshalProto(protoBytes)
+		if err != nil {
+			return events.APIGatewayProxyResponse{}, err
+		}
+		exportRequestMetrics := exportRequest.Metrics()
+		minMaxMetrics := pmetric.NewMetrics()
+		minMaxMetrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+		// TODO remove this after testing
+		updateMetricTimestamps(exportRequestMetrics, log)
+		// Parse metrics according to logzio naming conventions
+		for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
+			resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
+			// Handle resource attributes conversion
+			resourceAttributes := resourceMetrics.Resource().Attributes()
+			resourceAttributes.Range(func(k string, v pcommon.Value) bool {
+				resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+				return true
+			})
+			accountId, ok := resourceAttributes.Get("cloud.account.id")
+			if ok {
+				resourceAttributes.PutStr("account", accountId.AsString())
+				resourceAttributes.Remove("cloud.account.id")
+			}
+			region, ok := resourceAttributes.Get("cloud.region")
+			if ok {
+				resourceAttributes.PutStr("region", region.AsString())
+				resourceAttributes.Remove("cloud.region")
+			}
+			resourceAttributes.Remove("aws.exporter.arn")
+
+			for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
+				scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
+				for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
+					sm := scopeMetrics.Metrics().At(k)
+					// Convert metric name to Logz.io naming convention
+					newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(sm.Name(), "/", "_")), "amazonaws.com_", "")
+					sm.SetName(newName)
+					if sm.Summary().DataPoints().Len() > 1 {
+						log.Info("Metric has more than one data point", zap.Field{Key: "metric_name", Type: zapcore.StringType, String: sm.Name()})
+					}
+					for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
+						dp := sm.Summary().DataPoints().At(l)
+						dp.Attributes().Range(func(k string, v pcommon.Value) bool {
+							if k == "Dimensions" {
+								dimensions := v.AsRaw().(map[string]interface{})
+								for dimensionKey, dimensionValue := range dimensions {
+									dp.Attributes().PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
+								}
+								dp.Attributes().Remove(k)
+							} else {
+								dp.Attributes().PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+								dp.Attributes().Remove(k)
+							}
+							return true
+						})
+						// Create new min max metrics and remove quantiles
+						minMetric := pmetric.NewMetric()
+						minMetric.SetName(sm.Name() + minStr)
+						maxMetric := pmetric.NewMetric()
+						maxMetric.SetName(sm.Name() + maxStr)
+						minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+						maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+
+						minDp.SetTimestamp(dp.StartTimestamp())
+						maxDp.SetTimestamp(dp.StartTimestamp())
+						dp.Attributes().Range(func(k string, v pcommon.Value) bool {
+							minDp.Attributes().PutStr(k, v.AsString())
+							maxDp.Attributes().PutStr(k, v.AsString())
+							return true
+						})
+						minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
+						maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
+						minMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
+						maxMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
+
+						// Remove quantiles 0 and 1 that represent min and max
+						dp.QuantileValues().RemoveIf(func(qv pmetric.SummaryDataPointValueAtQuantile) bool {
+							return qv.Quantile() == 0 || qv.Quantile() == 1
+						})
+					}
 				}
 			}
 		}
-		log.Infof("Sending metrics, Bulk number: %d", bulkNum)
-		err = metricsExporter.PushMetrics(ctx, metricsToSend)
+		metricsToSend := pmetric.NewMetrics()
+		exportRequestMetrics.ResourceMetrics().MoveAndAppendTo(metricsToSend.ResourceMetrics())
+		minMaxMetrics.ResourceMetrics().MoveAndAppendTo(metricsToSend.ResourceMetrics())
+
+		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(bulkNum)})
+		err = metricsExporter.ConsumeMetrics(ctx, metricsToSend)
 		if err != nil {
-			log.Warnf("Error while sending metrics: %s", err)
+			log.Warn("Error while sending metrics", zap.Error(err))
 			if strings.Contains(err.Error(), "status 401") {
 				return generateValidFirehoseResponse(400, requestId, "Error while sending metrics:", err), nil
 			}
 			shippingErrors.Collect(err)
 		} else {
-			numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()
-			metricCount += numberOfMetrics
-			dataPointCount += numberOfDataPoints
+			metricCount += metricsToSend.MetricCount()
+			dataPointCount += metricsToSend.DataPointCount()
 		}
 	}
-	log.Infof("Found total of %d metrics with %d datapoints from the following namespaces %s", metricCount, dataPointCount, removeDuplicateValues(detectedNamespaces))
+	log.Info("Found total of %d metrics with %d data points from the following namespaces %s", zap.Field{Key: "metric_count", Type: zapcore.Int64Type, Integer: int64(metricCount)}, zap.Field{Key: "datapoint_count", Type: zapcore.Int64Type, Integer: int64(dataPointCount)})
 	log.Info("Shutting down metrics exporter")
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
-		log.Warnf("Error while shutting down exporter: %s", err)
+		log.Warn("Error while shutting down exporter", zap.Error(err))
 		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
