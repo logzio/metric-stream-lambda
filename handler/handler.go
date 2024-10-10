@@ -170,6 +170,7 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (e
 		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-1"},
 		ClientConfig: confighttp.ClientConfig{
 			Endpoint: getListenerUrl(*log),
+			Timeout:  5 * time.Second,
 			Headers:  map[string]configopaque.String{"Authorization": configopaque.String(fmt.Sprintf("Bearer %s", LogzioToken))},
 		},
 		ResourceToTelemetrySettings: resourcetotelemetry.Settings{
