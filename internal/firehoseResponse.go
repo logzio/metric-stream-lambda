@@ -1,4 +1,4 @@
-package handler
+package internal
 
 import (
 	"encoding/json"
@@ -14,19 +14,19 @@ type firehoseResponse struct {
 	ErrorMessage string `json:"errorMessage"`
 }
 
-type responseClient struct {
+type FirehoseResponseClient struct {
 	requestId string
 	logger    *zap.Logger
 }
 
-func newResponseClient(requestId string, logger *zap.Logger) *responseClient {
-	return &responseClient{
+func NewResponseClient(requestId string, logger *zap.Logger) *FirehoseResponseClient {
+	return &FirehoseResponseClient{
 		requestId: requestId,
 		logger:    logger,
 	}
 }
 
-func (rc *responseClient) generateValidFirehoseResponse(statusCode int, errorMessage string, err error) events.APIGatewayProxyResponse {
+func (rc *FirehoseResponseClient) GenerateValidFirehoseResponse(statusCode int, errorMessage string, err error) events.APIGatewayProxyResponse {
 	if errorMessage != "" {
 		rc.logger.Warn(errorMessage, zap.Error(err))
 		data := firehoseResponse{

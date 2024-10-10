@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/golang/protobuf/proto"
+	"github.com/logzio/metric-stream-lambda/internal"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 	"go.opentelemetry.io/collector/component"
@@ -307,29 +308,29 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	metricCount := 0
 	dataPointCount := 0
-	shippingErrors := new(errorCollector)
+	shippingErrors := new(internal.ErrorCollector)
 	requestId, LogzioToken := extractHeaders(request)
 	log := initLogger(ctx, request, LogzioToken)
-	firehoseResponseClient := newResponseClient(requestId, log)
+	firehoseResponseClient := internal.NewResponseClient(requestId, log)
 	defer log.Sync()
 	if LogzioToken == "" {
 		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
 		log.Error(accessKeyErr.Error())
-		return firehoseResponseClient.generateValidFirehoseResponse(400, "Error while getting access keys:", accessKeyErr), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error while getting access keys:", accessKeyErr), nil
 	}
 	metricsExporter, err := createPrometheusRemoteWriteExporter(log, LogzioToken)
 	if err != nil {
-		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while creating metrics exporter:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while creating metrics exporter:", err), nil
 	}
 	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
 	if err != nil {
-		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while starting metrics exporter:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while starting metrics exporter:", err), nil
 	}
 	log.Info("Starting to parse request body")
 	var body map[string]interface{}
 	err = json.Unmarshal([]byte(request.Body), &body)
 	if err != nil {
-		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while unmarshalling request body:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while unmarshalling request body:", err), nil
 	}
 	/*
 		api request body example structure:
@@ -356,14 +357,14 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
 		metricsToSend, err := processRecord(protoBuffer, log)
 		if err != nil {
-			return firehoseResponseClient.generateValidFirehoseResponse(400, "Error processing record:", err), nil
+			return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error processing record:", err), nil
 		}
 
 		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(recordIdx)})
 		err = metricsExporter.ConsumeMetrics(ctx, metricsToSend)
 		if err != nil {
 			if strings.Contains(err.Error(), "status 401") {
-				return firehoseResponseClient.generateValidFirehoseResponse(401, "Error while sending metrics:", err), nil
+				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", err), nil
 			}
 			shippingErrors.Collect(err)
 		} else {
@@ -375,10 +376,10 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	log.Info("Shutting down metrics exporter")
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
-		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while shutting down exporter:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
-		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while sending metrics:", shippingErrors.Error()), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while sending metrics:", shippingErrors.Error()), nil
 	}
-	return firehoseResponseClient.generateValidFirehoseResponse(200, "", nil), nil
+	return firehoseResponseClient.GenerateValidFirehoseResponse(200, "", nil), nil
 }
