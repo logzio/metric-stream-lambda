@@ -36,64 +36,6 @@ const (
 	maxStr = "_max"
 )
 
-var detectedNamespaces []string
-
-type ErrorCollector []error
-
-func (c *ErrorCollector) Collect(e error) { *c = append(*c, e) }
-
-func (c *ErrorCollector) Length() int {
-	return len(*c)
-}
-func (c *ErrorCollector) Error() error {
-	err := "Collected errors:\n"
-	for i, e := range *c {
-		err += fmt.Sprintf("\tError %d: %s\n", i, e.Error())
-	}
-	return errors.New(err)
-}
-
-type firehoseResponse struct {
-	RequestId    string `json:"requestId"`
-	Timestamp    int64  `json:"timestamp"`
-	ErrorMessage string `json:"errorMessage"`
-}
-
-func generateValidFirehoseResponse(statusCode int, requestId string, errorMessage string, err error) events.APIGatewayProxyResponse {
-	if errorMessage != "" {
-		data := firehoseResponse{
-			RequestId:    requestId,
-			Timestamp:    time.Now().Unix(),
-			ErrorMessage: fmt.Sprintf("%s %s", errorMessage, err.Error()),
-		}
-		jsonData, _ := json.Marshal(data)
-		return events.APIGatewayProxyResponse{
-			Body:       string(jsonData),
-			StatusCode: statusCode,
-			Headers: map[string]string{
-				"content-type": "application/json",
-			},
-			IsBase64Encoded:   false,
-			MultiValueHeaders: map[string][]string{},
-		}
-	} else {
-		data := firehoseResponse{
-			RequestId:    requestId,
-			Timestamp:    time.Now().Unix(),
-			ErrorMessage: "",
-		}
-		jsonData, _ := json.Marshal(data)
-		return events.APIGatewayProxyResponse{
-			Body:       string(jsonData),
-			StatusCode: statusCode,
-			Headers: map[string]string{
-				"content-type": "application/json",
-			},
-			IsBase64Encoded:   false,
-			MultiValueHeaders: map[string][]string{},
-		}
-	}
-}
 func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) *zap.Logger {
 	awsRequestId := ""
 	account := ""
@@ -157,25 +99,22 @@ func isDemoData(rawData string) bool {
 
 // Generates logzio listener url based on aws region
 func getListenerUrl(log zap.Logger) string {
-	var url string
 	// reserved lambda environment variable AWS_REGION https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
 	switch awsRegion := os.Getenv("AWS_REGION"); awsRegion {
 	case "us-east-1":
-		url = "https://listener.logz.io:8053"
+		return "https://listener.logz.io:8053"
 	case "ca-central-1":
-		url = "https://listener-ca.logz.io:8053"
+		return "https://listener-ca.logz.io:8053"
 	case "eu-central-1":
-		url = "https://listener-eu.logz.io:8053"
+		return "https://listener-eu.logz.io:8053"
 	case "eu-west-2":
-		url = "https://listener-uk.logz.io:8053"
+		return "https://listener-uk.logz.io:8053"
 	case "ap-southeast-2":
-		url = "https://listener-au.logz.io:8053"
+		return "https://listener-au.logz.io:8053"
 	default:
 		log.Info("Region is not supported yet, setting url to default value", zap.Field{Key: "region", Type: zapcore.StringType, String: awsRegion})
-		url = "https://listener.logz.io:8053"
+		return "https://listener.logz.io:8053"
 	}
-	log.Info("Setting logzio listener", zap.Field{Key: "url", Type: zapcore.StringType, String: url})
-	return url
 }
 
 func updateMetricTimestamps(metrics pmetric.Metrics, log *zap.Logger) {
@@ -210,11 +149,7 @@ func updateMetricTimestamps(metrics pmetric.Metrics, log *zap.Logger) {
 	}
 }
 
-func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	metricCount := 0
-	dataPointCount := 0
-	shippingErrors := new(ErrorCollector)
-	// get requestId to match firehose response requirements
+func extractHeaders(request events.APIGatewayProxyRequest) (string, string) {
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	if requestId == "" {
 		requestId = request.Headers["x-amz-firehose-request-id"]
@@ -223,15 +158,10 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	if LogzioToken == "" {
 		LogzioToken = request.Headers["x-amz-firehose-access-key"]
 	}
-	log := initLogger(ctx, request, LogzioToken)
-	defer log.Sync()
+	return requestId, LogzioToken
+}
 
-	if LogzioToken == "" {
-		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
-		log.Error(accessKeyErr.Error())
-		return generateValidFirehoseResponse(400, requestId, "Error while getting access keys:", accessKeyErr), nil
-	}
-	// Initializing prometheus remote write exporter
+func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (exporter.Metrics, error) {
 	cfg := &prometheusremotewriteexporter.Config{
 		Namespace:      "",
 		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-1"},
@@ -273,20 +203,42 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	metricsExporter, err := prometheusremotewriteexporter.NewFactory().CreateMetricsExporter(context.Background(), settings, cfg)
 	if err != nil {
 		log.Info("Error while creating metrics exporter", zap.Error(err))
-		return generateValidFirehoseResponse(500, requestId, "Error while creating metrics exporter:", err), nil
+		return nil, err
+	}
+	err = metricsExporter.Start(context.Background(), componenttest.NewNopHost())
+	if err != nil {
+		log.Info("Error while starting metrics exporter", zap.Error(err))
+		return nil, err
+	}
+	return metricsExporter, nil
+}
+
+func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	metricCount := 0
+	dataPointCount := 0
+	shippingErrors := new(ErrorCollector)
+	requestId, LogzioToken := extractHeaders(request)
+	log := initLogger(ctx, request, LogzioToken)
+	firehoseResponseClient := newResponseClient(requestId, log)
+	defer log.Sync()
+	if LogzioToken == "" {
+		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
+		log.Error(accessKeyErr.Error())
+		return firehoseResponseClient.generateValidFirehoseResponse(400, "Error while getting access keys:", accessKeyErr), nil
+	}
+	metricsExporter, err := createPrometheusRemoteWriteExporter(log, LogzioToken)
+	if err != nil {
+		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while creating metrics exporter:", err), nil
 	}
 	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
 	if err != nil {
-		log.Info("Error while starting metrics exporter", zap.Error(err))
-		return generateValidFirehoseResponse(500, requestId, "Error while starting metrics exporter:", err), nil
+		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while starting metrics exporter:", err), nil
 	}
-
 	log.Info("Starting to parse request body")
 	var body map[string]interface{}
 	err = json.Unmarshal([]byte(request.Body), &body)
 	if err != nil {
-		log.Info("Error while unmarshalling request body", zap.Error(err))
-		return generateValidFirehoseResponse(500, requestId, "Error while unmarshalling request body:", err), nil
+		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while unmarshalling request body:", err), nil
 	}
 	/*
 		api request body example structure:
@@ -316,12 +268,11 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 		err = protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
 		if err != nil {
-			log.Warn("Error decoding otlp proto message, make sure you are using opentelemetry 1.0 metrics format. Error message", zap.Error(err))
-			return generateValidFirehoseResponse(400, requestId, "Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message:", err), nil
+			return firehoseResponseClient.generateValidFirehoseResponse(400, "Error decoding otlp proto message, make sure you are using opentelemetry 1.0 metrics format. Error message:", err), nil
 		}
 		protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
 		if marshalErr != nil {
-			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
+			return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while converting otlp proto message to proto bytes:", marshalErr), nil
 		}
 		exportRequest := pmetricotlp.NewExportRequest()
 		err = exportRequest.UnmarshalProto(protoBytes)
@@ -414,9 +365,8 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(bulkNum)})
 		err = metricsExporter.ConsumeMetrics(ctx, metricsToSend)
 		if err != nil {
-			log.Warn("Error while sending metrics", zap.Error(err))
 			if strings.Contains(err.Error(), "status 401") {
-				return generateValidFirehoseResponse(400, requestId, "Error while sending metrics:", err), nil
+				return firehoseResponseClient.generateValidFirehoseResponse(401, "Error while sending metrics:", err), nil
 			}
 			shippingErrors.Collect(err)
 		} else {
@@ -424,15 +374,14 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			dataPointCount += metricsToSend.DataPointCount()
 		}
 	}
-	log.Info("Found total of %d metrics with %d data points from the following namespaces %s", zap.Field{Key: "metric_count", Type: zapcore.Int64Type, Integer: int64(metricCount)}, zap.Field{Key: "datapoint_count", Type: zapcore.Int64Type, Integer: int64(dataPointCount)})
+	log.Info("Found metrics with data points", zap.Field{Key: "metric_count", Type: zapcore.Int64Type, Integer: int64(metricCount)}, zap.Field{Key: "datapoint_count", Type: zapcore.Int64Type, Integer: int64(dataPointCount)})
 	log.Info("Shutting down metrics exporter")
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
-		log.Warn("Error while shutting down exporter", zap.Error(err))
-		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), nil
+		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
-		return generateValidFirehoseResponse(500, requestId, "Error while sending metrics:", shippingErrors.Error()), nil
+		return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while sending metrics:", shippingErrors.Error()), nil
 	}
-	return generateValidFirehoseResponse(200, requestId, "", nil), nil
+	return firehoseResponseClient.generateValidFirehoseResponse(200, "", nil), nil
 }
