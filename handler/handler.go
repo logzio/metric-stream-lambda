@@ -33,8 +33,10 @@ import (
 )
 
 const (
-	minStr = "_min"
-	maxStr = "_max"
+	minStr            = "_min"
+	maxStr            = "_max"
+	cloudAccountIdAtt = "cloud.account.id"
+	cloudRegionAtt    = "cloud.region"
 )
 
 func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) *zap.Logger {
@@ -207,6 +209,24 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (e
 	return metricsExporter, nil
 }
 
+func convertResourceAttributes(resourceAttributes pcommon.Map) {
+	resourceAttributes.Range(func(k string, v pcommon.Value) bool {
+		resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+		return true
+	})
+	accountId, ok := resourceAttributes.Get(cloudAccountIdAtt)
+	if ok {
+		resourceAttributes.PutStr("account", accountId.AsString())
+		resourceAttributes.Remove(cloudAccountIdAtt)
+	}
+	region, ok := resourceAttributes.Get(cloudRegionAtt)
+	if ok {
+		resourceAttributes.PutStr("region", region.AsString())
+		resourceAttributes.Remove(cloudRegionAtt)
+	}
+	resourceAttributes.Remove("aws.exporter.arn")
+}
+
 func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics, error) {
 	protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 	err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
@@ -230,24 +250,8 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 	// Parse metrics according to logzio naming conventions
 	for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
 		resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
-		// Handle resource attributes conversion
 		resourceAttributes := resourceMetrics.Resource().Attributes()
-		resourceAttributes.Range(func(k string, v pcommon.Value) bool {
-			resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
-			return true
-		})
-		accountId, ok := resourceAttributes.Get("cloud.account.id")
-		if ok {
-			resourceAttributes.PutStr("account", accountId.AsString())
-			resourceAttributes.Remove("cloud.account.id")
-		}
-		region, ok := resourceAttributes.Get("cloud.region")
-		if ok {
-			resourceAttributes.PutStr("region", region.AsString())
-			resourceAttributes.Remove("cloud.region")
-		}
-		resourceAttributes.Remove("aws.exporter.arn")
-
+		convertResourceAttributes(resourceAttributes)
 		for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
 			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
 			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
