@@ -9,85 +9,37 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/golang/protobuf/proto"
+	"github.com/logzio/metric-stream-lambda/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
-	"go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configtelemetry"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/sdk/trace"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"os"
 	"strings"
 	"time"
 )
 
 const (
-	sumStr   = "_sum"
-	countStr = "_count"
-	minStr   = "_min"
-	maxStr   = "_max"
+	minStr            = "_min"
+	maxStr            = "_max"
+	cloudAccountIdAtt = "cloud.account.id"
+	cloudRegionAtt    = "cloud.region"
 )
 
-var detectedNamespaces []string
-
-type ErrorCollector []error
-
-func (c *ErrorCollector) Collect(e error) { *c = append(*c, e) }
-
-func (c *ErrorCollector) Length() int {
-	return len(*c)
-}
-func (c *ErrorCollector) Error() error {
-	err := "Collected errors:\n"
-	for i, e := range *c {
-		err += fmt.Sprintf("\tError %d: %s\n", i, e.Error())
-	}
-	return errors.New(err)
-}
-
-type firehoseResponse struct {
-	RequestId    string `json:"requestId"`
-	Timestamp    int64  `json:"timestamp"`
-	ErrorMessage string `json:"errorMessage"`
-}
-
-func generateValidFirehoseResponse(statusCode int, requestId string, errorMessage string, err error) events.APIGatewayProxyResponse {
-	if errorMessage != "" {
-		data := firehoseResponse{
-			RequestId:    requestId,
-			Timestamp:    time.Now().Unix(),
-			ErrorMessage: fmt.Sprintf("%s %s", errorMessage, err.Error()),
-		}
-		jsonData, _ := json.Marshal(data)
-		return events.APIGatewayProxyResponse{
-			Body:       string(jsonData),
-			StatusCode: statusCode,
-			Headers: map[string]string{
-				"content-type": "application/json",
-			},
-			IsBase64Encoded:   false,
-			MultiValueHeaders: map[string][]string{},
-		}
-	} else {
-		data := firehoseResponse{
-			RequestId:    requestId,
-			Timestamp:    time.Now().Unix(),
-			ErrorMessage: "",
-		}
-		jsonData, _ := json.Marshal(data)
-		return events.APIGatewayProxyResponse{
-			Body:       string(jsonData),
-			StatusCode: statusCode,
-			Headers: map[string]string{
-				"content-type": "application/json",
-			},
-			IsBase64Encoded:   false,
-			MultiValueHeaders: map[string][]string{},
-		}
-	}
-}
-func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) zap.SugaredLogger {
+func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) *zap.Logger {
 	awsRequestId := ""
 	account := ""
 	logzioIdentifier := ""
@@ -117,7 +69,7 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, toke
 		fmt.Printf("Error while initializing the logger: %v", configErr)
 		panic(configErr)
 	}
-	return *logger.Sugar()
+	return logger
 }
 
 // Takes a base64 encoded string and returns decoded string
@@ -149,116 +101,26 @@ func isDemoData(rawData string) bool {
 }
 
 // Generates logzio listener url based on aws region
-func getListenerUrl(log zap.SugaredLogger) string {
-	var url string
+func getListenerUrl(log zap.Logger) string {
 	// reserved lambda environment variable AWS_REGION https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
 	switch awsRegion := os.Getenv("AWS_REGION"); awsRegion {
 	case "us-east-1":
-		url = "https://listener.logz.io:8053"
+		return "https://listener.logz.io:8053"
 	case "ca-central-1":
-		url = "https://listener-ca.logz.io:8053"
+		return "https://listener-ca.logz.io:8053"
 	case "eu-central-1":
-		url = "https://listener-eu.logz.io:8053"
+		return "https://listener-eu.logz.io:8053"
 	case "eu-west-2":
-		url = "https://listener-uk.logz.io:8053"
+		return "https://listener-uk.logz.io:8053"
 	case "ap-southeast-2":
-		url = "https://listener-au.logz.io:8053"
+		return "https://listener-au.logz.io:8053"
 	default:
-		log.Infof("Region '%s' is not supported yet, setting url to default value", awsRegion)
-		url = "https://listener.logz.io:8053"
-	}
-	log.Infof("Setting logzio listener url to: %s", url)
-	return url
-}
-
-// Takes origin metric and suffix based on desired aggregation. Creates new DoubleSum metric with origin name plus suffix, origin unit and origin description
-func createMetricFromAttributes(metric pdata.Metric, suffix string) pdata.Metric {
-	destMetric := pdata.NewMetric()
-	destMetric.SetName(metric.Name() + suffix)
-	destMetric.SetDataType(pdata.MetricDataTypeDoubleSum)
-	destMetric.SetUnit(metric.Unit())
-	destMetric.SetDescription(metric.Description())
-	destMetric.DoubleSum().SetAggregationTemporality(pdata.AggregationTemporalityCumulative)
-	return destMetric
-}
-
-// Takes origin datapoint, destination datapoint and resource attributes. Coping labels from origin and adding resource attributes as labels
-func addLabelsAndResourceAttributes(dp pdata.SummaryDataPoint, destDp pdata.DoubleDataPoint, resourceAttributes pdata.AttributeMap) {
-	dp.LabelsMap().Range(func(k string, v string) bool {
-		destDp.LabelsMap().Insert(strings.ToLower(k), strings.ToLower(v))
-		return true
-	})
-	accountId, _ := resourceAttributes.Get("cloud.account.id")
-	region, _ := resourceAttributes.Get("cloud.region")
-	destDp.LabelsMap().Insert("account", accountId.StringVal())
-	destDp.LabelsMap().Insert("region", region.StringVal())
-}
-
-// Takes Summary metric and generates new metrics (sum, count, min, max) than add them to metricsToSend
-func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetricsSlice, metric pdata.Metric, resourceAttributes pdata.AttributeMap) {
-	// Converts to new name (example: amazonaws.com/AWS/AppRunner/ActiveInstances -> aws_apprunner_activeinstances)
-	newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(metric.Name(), "/", "_")), "amazonaws.com_", "")
-	metric.SetName(newName)
-	// Assuming Summary metric type according to AWS docs:
-	// https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/acw-ug.pdf#CloudWatch-metric-streams-formats-opentelemetry
-	// Page 262
-	var dps = metric.Summary().DataPoints()
-	// Generate new metrics (sum, count, min, max), and for each summary data point, lowercase all attributes and add resource attributes
-	sumMetric := createMetricFromAttributes(metric, sumStr)
-	countMetric := createMetricFromAttributes(metric, countStr)
-	maxMetric := createMetricFromAttributes(metric, maxStr)
-	minMetric := createMetricFromAttributes(metric, minStr)
-	quantileMetric := createMetricFromAttributes(metric, "")
-	for d := 0; d < dps.Len(); d++ {
-		datapoint := dps.At(d)
-		namespace, _ := datapoint.LabelsMap().Get("Namespace")
-		detectedNamespaces = append(detectedNamespaces, namespace)
-		// Sum datapoint
-		sumDp := sumMetric.DoubleSum().DataPoints().AppendEmpty()
-		sumDp.SetValue(datapoint.Sum())
-		sumDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, sumDp, resourceAttributes)
-		// Count datapoint
-		countDp := countMetric.DoubleSum().DataPoints().AppendEmpty()
-		countDp.SetValue(float64(datapoint.Count()))
-
-		countDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, countDp, resourceAttributes)
-		// Min datapoint
-		minDp := minMetric.DoubleSum().DataPoints().AppendEmpty()
-		minDp.SetValue(datapoint.QuantileValues().At(0).Value())
-		minDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, minDp, resourceAttributes)
-		// Max datapoint
-		maxDp := maxMetric.DoubleSum().DataPoints().AppendEmpty()
-		maxDp.SetValue(datapoint.QuantileValues().At(datapoint.QuantileValues().Len() - 1).Value())
-		maxDp.SetTimestamp(datapoint.Timestamp())
-		addLabelsAndResourceAttributes(datapoint, maxDp, resourceAttributes)
-		// If the count value is greater than 1, and we have more than 2 Quantiles we need to add datapoints for each quantileValues
-		if datapoint.Count() > 1 && datapoint.QuantileValues().Len() > 2 && datapoint.Sum() > 0 {
-			for i := 1; i < datapoint.QuantileValues().Len()-1; i++ {
-				quantileDp := quantileMetric.DoubleSum().DataPoints().AppendEmpty()
-				quantileDp.SetValue(datapoint.QuantileValues().At(i).Value())
-				quantileDp.SetTimestamp(datapoint.Timestamp())
-				quantileDp.LabelsMap().Insert("quantile", fmt.Sprintf("%v", datapoint.QuantileValues().At(i).Quantile()))
-				addLabelsAndResourceAttributes(datapoint, quantileDp, resourceAttributes)
-			}
-		}
-	}
-	// Add new aggregated metrics to destination
-	sumMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	countMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	maxMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	minMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
-	if quantileMetric.DoubleSum().DataPoints().Len() > 0 {
-		quantileMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
+		log.Info("Region is not supported yet, setting url to default value", zap.Field{Key: "region", Type: zapcore.StringType, String: awsRegion})
+		return "https://listener.logz.io:8053"
 	}
 }
-func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	metricCount := 0
-	dataPointCount := 0
-	shippingErrors := new(ErrorCollector)
-	// get requestId to match firehose response requirements
+
+func extractHeaders(request events.APIGatewayProxyRequest) (string, string) {
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	if requestId == "" {
 		requestId = request.Headers["x-amz-firehose-request-id"]
@@ -267,52 +129,186 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	if LogzioToken == "" {
 		LogzioToken = request.Headers["x-amz-firehose-access-key"]
 	}
+	return requestId, LogzioToken
+}
+
+func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (exporter.Metrics, error) {
+	cfg := &prometheusremotewriteexporter.Config{
+		Namespace:      "",
+		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-1"},
+		ClientConfig: confighttp.ClientConfig{
+			Endpoint: getListenerUrl(*log),
+			Timeout:  5 * time.Second,
+			Headers:  map[string]configopaque.String{"Authorization": configopaque.String(fmt.Sprintf("Bearer %s", LogzioToken))},
+		},
+		ResourceToTelemetrySettings: resourcetotelemetry.Settings{
+			Enabled: true,
+		},
+		TargetInfo: &prometheusremotewriteexporter.TargetInfo{
+			Enabled: false,
+		},
+		CreatedMetric: &prometheusremotewriteexporter.CreatedMetric{
+			Enabled: false,
+		},
+		RemoteWriteQueue: prometheusremotewriteexporter.RemoteWriteQueue{
+			Enabled:      true,
+			NumConsumers: 3,
+			QueueSize:    1000,
+		},
+		MaxBatchSizeBytes: 3000000,
+	}
+	settings := exporter.Settings{
+		TelemetrySettings: component.TelemetrySettings{
+			Logger:         log,
+			MetricsLevel:   configtelemetry.LevelNone,
+			TracerProvider: trace.NewTracerProvider(),
+			LeveledMeterProvider: func(level configtelemetry.Level) metric.MeterProvider {
+				return noop.NewMeterProvider()
+			},
+		},
+		BuildInfo: component.BuildInfo{
+			Description: "logzioMetricStream",
+			Version:     "1.0",
+		},
+	}
+	metricsExporter, err := prometheusremotewriteexporter.NewFactory().CreateMetricsExporter(context.Background(), settings, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return metricsExporter, nil
+}
+
+func convertResourceAttributes(resourceAttributes pcommon.Map) {
+	resourceAttributes.Range(func(k string, v pcommon.Value) bool {
+		resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+		return true
+	})
+	accountId, ok := resourceAttributes.Get(cloudAccountIdAtt)
+	if ok {
+		resourceAttributes.PutStr("account", accountId.AsString())
+		resourceAttributes.Remove(cloudAccountIdAtt)
+	}
+	region, ok := resourceAttributes.Get(cloudRegionAtt)
+	if ok {
+		resourceAttributes.PutStr("region", region.AsString())
+		resourceAttributes.Remove(cloudRegionAtt)
+	}
+	resourceAttributes.Remove("aws.exporter.arn")
+}
+
+func convertAttributes(attributes pcommon.Map) {
+	attributes.Range(func(k string, v pcommon.Value) bool {
+		if k == "Dimensions" {
+			dimensions := v.AsRaw().(map[string]interface{})
+			for dimensionKey, dimensionValue := range dimensions {
+				attributes.PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
+			}
+			attributes.Remove(k)
+		} else {
+			attributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+			attributes.Remove(k)
+		}
+		return true
+	})
+}
+
+func createMinMaxMetrics(metricName string, dp pmetric.SummaryDataPoint) (pmetric.Metric, pmetric.Metric) {
+	minMetric := pmetric.NewMetric()
+	minMetric.SetName(metricName + minStr)
+	maxMetric := pmetric.NewMetric()
+	maxMetric.SetName(metricName + maxStr)
+	minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+	maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+
+	minDp.SetTimestamp(dp.StartTimestamp())
+	maxDp.SetTimestamp(dp.StartTimestamp())
+	dp.Attributes().Range(func(k string, v pcommon.Value) bool {
+		minDp.Attributes().PutStr(k, v.AsString())
+		maxDp.Attributes().PutStr(k, v.AsString())
+		return true
+	})
+	minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
+	maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
+
+	return minMetric, maxMetric
+}
+
+func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics, error) {
+	protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
+	err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
+	if err != nil {
+		return pmetric.Metrics{}, err
+	}
+	protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
+	if marshalErr != nil {
+		return pmetric.Metrics{}, marshalErr
+	}
+	exportRequest := pmetricotlp.NewExportRequest()
+	err = exportRequest.UnmarshalProto(protoBytes)
+	if err != nil {
+		return pmetric.Metrics{}, err
+	}
+	exportRequestMetrics := exportRequest.Metrics()
+	minMaxMetrics := pmetric.NewMetrics()
+	minMaxMetrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	// Parse metrics according to logzio naming conventions
+	for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
+		resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
+		convertResourceAttributes(resourceMetrics.Resource().Attributes())
+		for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
+			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
+			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
+				sm := scopeMetrics.Metrics().At(k)
+				// Convert metric name to Logz.io naming convention
+				newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(sm.Name(), "/", "_")), "amazonaws.com_", "")
+				sm.SetName(newName)
+				if sm.Summary().DataPoints().Len() > 1 {
+					log.Info("Metric has more than one data point", zap.Field{Key: "metric_name", Type: zapcore.StringType, String: sm.Name()})
+				}
+				for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
+					dp := sm.Summary().DataPoints().At(l)
+					convertAttributes(dp.Attributes())
+					minMetric, maxMetric := createMinMaxMetrics(sm.Name(), dp)
+					minMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
+					maxMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
+					// Remove quantiles 0 and 1 that represent min and max values
+					dp.QuantileValues().RemoveIf(func(qv pmetric.SummaryDataPointValueAtQuantile) bool {
+						return qv.Quantile() == 0 || qv.Quantile() == 1
+					})
+				}
+			}
+		}
+	}
+	minMaxMetrics.ResourceMetrics().MoveAndAppendTo(exportRequestMetrics.ResourceMetrics())
+	return exportRequestMetrics, nil
+}
+
+func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	metricCount := 0
+	dataPointCount := 0
+	shippingErrors := new(internal.ErrorCollector)
+	requestId, LogzioToken := extractHeaders(request)
 	log := initLogger(ctx, request, LogzioToken)
-	// flush buffered logs if exists, before the function run ends
+	firehoseResponseClient := internal.NewResponseClient(requestId, log)
 	defer log.Sync()
 	if LogzioToken == "" {
 		accessKeyErr := errors.New("cant find access key in 'X-Amz-Firehose-Access-Key' or 'x-amz-firehose-access-key' headers")
-		log.Error(accessKeyErr)
-		return generateValidFirehoseResponse(400, requestId, "Error while getting access keys:", accessKeyErr), nil
+		log.Error(accessKeyErr.Error())
+		return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error while getting access keys:", accessKeyErr), nil
 	}
-
-	// Initializing prometheus remote write exporter
-	cfg := &prometheusremotewriteexporter.Config{
-		TimeoutSettings: exporterhelper.TimeoutSettings{},
-		RetrySettings: exporterhelper.RetrySettings{
-			Enabled:         true,
-			InitialInterval: 500 * time.Millisecond,
-			MaxInterval:     1 * time.Second,
-		},
-		Namespace:      "",
-		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-cloudwatch-stream-metrics"},
-		HTTPClientSettings: confighttp.HTTPClientSettings{
-			Endpoint: getListenerUrl(log),
-			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LogzioToken)},
-		},
-	}
-	cfg.RemoteWriteQueue.NumConsumers = 3
-	buildInfo := component.BuildInfo{
-		Description: "OpenTelemetry",
-		Version:     "0.7",
-	}
-	log.Info("Starting metrics exporter")
-	metricsExporter, err := prometheusremotewriteexporter.NewPRWExporter(cfg, buildInfo)
+	metricsExporter, err := createPrometheusRemoteWriteExporter(log, LogzioToken)
 	if err != nil {
-		log.Infof("Error while creating metrics exporter: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while creating metrics exporter:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while creating metrics exporter:", err), nil
 	}
 	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
 	if err != nil {
-		log.Infof("Error while starting metrics exporter: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while starting metrics exporter:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while starting metrics exporter:", err), nil
 	}
 	log.Info("Starting to parse request body")
 	var body map[string]interface{}
 	err = json.Unmarshal([]byte(request.Body), &body)
 	if err != nil {
-		log.Infof("Error while unmarshalling request body: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while unmarshalling request body:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while unmarshalling request body:", err), nil
 	}
 	/*
 		api request body example structure:
@@ -330,67 +326,38 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		}
 	*/
 	records := body["records"].([]interface{})
-	for bulkNum, record := range records {
-		//Converting the data to string
+	for recordIdx, record := range records {
 		data := record.(map[string]interface{})["data"].(string)
-		//Decoding data and convert to otlp proto message
 		rawDecodedText, _ := base64Decode(data)
 		if isDemoData(rawDecodedText) {
 			continue
 		}
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
-		ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
-		err = protoBuffer.DecodeMessage(ExportMetricsServiceRequest)
+		metricsToSend, err := processRecord(protoBuffer, log)
 		if err != nil {
-			log.Warnf("Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message: %s", err)
-			return generateValidFirehoseResponse(400, requestId, "Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message:", err), nil
+			return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error processing record:", err), nil
 		}
-		// Converting otlp proto message to proto bytes
-		protoBytes, err := proto.Marshal(ExportMetricsServiceRequest)
-		if err != nil {
-			log.Warnf("Error while converting otlp proto message to proto bytes: %s", err)
-			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
-		}
-		// Converting otlp proto bytes to pdata.metrics
-		metrics, err := pdata.MetricsFromOtlpProtoBytes(protoBytes)
-		// represents the metrics to send after converting from summary to sum, count, min, max (those are the metrics we are actually going to send)
-		metricsToSend := pdata.NewMetrics()
-		aggregatedInstrumentationLibraryMetrics := metricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
-		// Lopping threw all metrics and data points, generate new metrics (sum, count, min, max) and enhance labels with logz.io naming conventions and resource attributes
-		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
-			resource := metrics.ResourceMetrics().At(i)
-			resourceAttributes := resource.Resource().Attributes()
-			for j := 0; j < resource.InstrumentationLibraryMetrics().Len(); j++ {
-				instrumentationLibraryMetrics := resource.InstrumentationLibraryMetrics().At(j)
-				for k := 0; k < instrumentationLibraryMetrics.Metrics().Len(); k++ {
-					metric := instrumentationLibraryMetrics.Metrics().At(k)
-					summaryValuesToMetrics(aggregatedInstrumentationLibraryMetrics, metric, resourceAttributes)
-				}
-			}
-		}
-		log.Infof("Sending metrics, Bulk number: %d", bulkNum)
-		err = metricsExporter.PushMetrics(ctx, metricsToSend)
-		if err != nil {
-			log.Warnf("Error while sending metrics: %s", err)
-			if strings.Contains(err.Error(), "status 401") {
-				return generateValidFirehoseResponse(400, requestId, "Error while sending metrics:", err), nil
+
+		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(recordIdx)})
+		shippingErr := metricsExporter.ConsumeMetrics(ctx, metricsToSend)
+		if shippingErr != nil {
+			if strings.Contains(shippingErr.Error(), "status 401") {
+				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", shippingErr), nil
 			}
 			shippingErrors.Collect(err)
 		} else {
-			numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()
-			metricCount += numberOfMetrics
-			dataPointCount += numberOfDataPoints
+			metricCount += metricsToSend.MetricCount()
+			dataPointCount += metricsToSend.DataPointCount()
 		}
 	}
-	log.Infof("Found total of %d metrics with %d datapoints from the following namespaces %s", metricCount, dataPointCount, removeDuplicateValues(detectedNamespaces))
+	log.Info("Found metrics with data points", zap.Field{Key: "metric_count", Type: zapcore.Int64Type, Integer: int64(metricCount)}, zap.Field{Key: "datapoint_count", Type: zapcore.Int64Type, Integer: int64(dataPointCount)})
 	log.Info("Shutting down metrics exporter")
 	err = metricsExporter.Shutdown(ctx)
 	if err != nil {
-		log.Warnf("Error while shutting down exporter: %s", err)
-		return generateValidFirehoseResponse(500, requestId, "Error while shutting down exporter:", err), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
-		return generateValidFirehoseResponse(500, requestId, "Error while sending metrics:", shippingErrors.Error()), nil
+		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while sending metrics:", shippingErrors.Error()), nil
 	}
-	return generateValidFirehoseResponse(200, requestId, "", nil), nil
+	return firehoseResponseClient.GenerateValidFirehoseResponse(200, "", nil), nil
 }
