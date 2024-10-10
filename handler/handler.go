@@ -120,38 +120,6 @@ func getListenerUrl(log zap.Logger) string {
 	}
 }
 
-func updateMetricTimestamps(metrics pmetric.Metrics, log *zap.Logger) {
-	for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
-		resourceMetrics := metrics.ResourceMetrics().At(i)
-		for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
-			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
-			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
-				m := scopeMetrics.Metrics().At(k)
-				switch m.Type() {
-				case pmetric.MetricTypeGauge:
-					for l := 0; l < m.Gauge().DataPoints().Len(); l++ {
-						m.Gauge().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
-					}
-				case pmetric.MetricTypeSum:
-					for l := 0; l < m.Sum().DataPoints().Len(); l++ {
-						m.Sum().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
-					}
-				case pmetric.MetricTypeHistogram:
-					for l := 0; l < m.Histogram().DataPoints().Len(); l++ {
-						m.Histogram().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
-					}
-				case pmetric.MetricTypeSummary:
-					for l := 0; l < m.Summary().DataPoints().Len(); l++ {
-						m.Summary().DataPoints().At(l).SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
-					}
-				default:
-					log.Info("Unknown metric type", zap.Field{Key: "metric_type", Type: zapcore.StringType, String: m.Type().String()})
-				}
-			}
-		}
-	}
-}
-
 func extractHeaders(request events.APIGatewayProxyRequest) (string, string) {
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	if requestId == "" {
@@ -283,8 +251,6 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 	exportRequestMetrics := exportRequest.Metrics()
 	minMaxMetrics := pmetric.NewMetrics()
 	minMaxMetrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
-	// TODO remove this after testing
-	updateMetricTimestamps(exportRequestMetrics, log)
 	// Parse metrics according to logzio naming conventions
 	for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
 		resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
