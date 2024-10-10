@@ -199,18 +199,109 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (e
 			Version:     "1.0",
 		},
 	}
-	log.Info("Starting metrics exporter")
 	metricsExporter, err := prometheusremotewriteexporter.NewFactory().CreateMetricsExporter(context.Background(), settings, cfg)
 	if err != nil {
-		log.Info("Error while creating metrics exporter", zap.Error(err))
-		return nil, err
-	}
-	err = metricsExporter.Start(context.Background(), componenttest.NewNopHost())
-	if err != nil {
-		log.Info("Error while starting metrics exporter", zap.Error(err))
 		return nil, err
 	}
 	return metricsExporter, nil
+}
+
+func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics, error) {
+	protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
+	err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
+	if err != nil {
+		return pmetric.Metrics{}, err
+	}
+	protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
+	if marshalErr != nil {
+		return pmetric.Metrics{}, marshalErr
+	}
+	exportRequest := pmetricotlp.NewExportRequest()
+	err = exportRequest.UnmarshalProto(protoBytes)
+	if err != nil {
+		return pmetric.Metrics{}, err
+	}
+	exportRequestMetrics := exportRequest.Metrics()
+	minMaxMetrics := pmetric.NewMetrics()
+	minMaxMetrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	// TODO remove this after testing
+	updateMetricTimestamps(exportRequestMetrics, log)
+	// Parse metrics according to logzio naming conventions
+	for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
+		resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
+		// Handle resource attributes conversion
+		resourceAttributes := resourceMetrics.Resource().Attributes()
+		resourceAttributes.Range(func(k string, v pcommon.Value) bool {
+			resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+			return true
+		})
+		accountId, ok := resourceAttributes.Get("cloud.account.id")
+		if ok {
+			resourceAttributes.PutStr("account", accountId.AsString())
+			resourceAttributes.Remove("cloud.account.id")
+		}
+		region, ok := resourceAttributes.Get("cloud.region")
+		if ok {
+			resourceAttributes.PutStr("region", region.AsString())
+			resourceAttributes.Remove("cloud.region")
+		}
+		resourceAttributes.Remove("aws.exporter.arn")
+
+		for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
+			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
+			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
+				sm := scopeMetrics.Metrics().At(k)
+				// Convert metric name to Logz.io naming convention
+				newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(sm.Name(), "/", "_")), "amazonaws.com_", "")
+				sm.SetName(newName)
+				if sm.Summary().DataPoints().Len() > 1 {
+					log.Info("Metric has more than one data point", zap.Field{Key: "metric_name", Type: zapcore.StringType, String: sm.Name()})
+				}
+				for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
+					dp := sm.Summary().DataPoints().At(l)
+					dp.Attributes().Range(func(k string, v pcommon.Value) bool {
+						if k == "Dimensions" {
+							dimensions := v.AsRaw().(map[string]interface{})
+							for dimensionKey, dimensionValue := range dimensions {
+								dp.Attributes().PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
+							}
+							dp.Attributes().Remove(k)
+						} else {
+							dp.Attributes().PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+							dp.Attributes().Remove(k)
+						}
+						return true
+					})
+					// Create new min max metrics and remove quantiles
+					minMetric := pmetric.NewMetric()
+					minMetric.SetName(sm.Name() + minStr)
+					maxMetric := pmetric.NewMetric()
+					maxMetric.SetName(sm.Name() + maxStr)
+					minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+					maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+
+					minDp.SetTimestamp(dp.StartTimestamp())
+					maxDp.SetTimestamp(dp.StartTimestamp())
+					dp.Attributes().Range(func(k string, v pcommon.Value) bool {
+						minDp.Attributes().PutStr(k, v.AsString())
+						maxDp.Attributes().PutStr(k, v.AsString())
+						return true
+					})
+					minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
+					maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
+					minMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
+					maxMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
+
+					// Remove quantiles 0 and 1 that represent min and max
+					dp.QuantileValues().RemoveIf(func(qv pmetric.SummaryDataPointValueAtQuantile) bool {
+						return qv.Quantile() == 0 || qv.Quantile() == 1
+					})
+				}
+			}
+		}
+	}
+	minMaxMetrics.ResourceMetrics().MoveAndAppendTo(exportRequestMetrics.ResourceMetrics())
+	return exportRequestMetrics, nil
 }
 
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
@@ -256,113 +347,19 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		}
 	*/
 	records := body["records"].([]interface{})
-	for bulkNum, record := range records {
-		//Converting the data to string
+	for recordIdx, record := range records {
 		data := record.(map[string]interface{})["data"].(string)
-		//Decoding data and convert to otlp proto message
 		rawDecodedText, _ := base64Decode(data)
 		if isDemoData(rawDecodedText) {
 			continue
 		}
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
-		protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
-		err = protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
+		metricsToSend, err := processRecord(protoBuffer, log)
 		if err != nil {
-			return firehoseResponseClient.generateValidFirehoseResponse(400, "Error decoding otlp proto message, make sure you are using opentelemetry 1.0 metrics format. Error message:", err), nil
+			return firehoseResponseClient.generateValidFirehoseResponse(400, "Error processing record:", err), nil
 		}
-		protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
-		if marshalErr != nil {
-			return firehoseResponseClient.generateValidFirehoseResponse(500, "Error while converting otlp proto message to proto bytes:", marshalErr), nil
-		}
-		exportRequest := pmetricotlp.NewExportRequest()
-		err = exportRequest.UnmarshalProto(protoBytes)
-		if err != nil {
-			return events.APIGatewayProxyResponse{}, err
-		}
-		exportRequestMetrics := exportRequest.Metrics()
-		minMaxMetrics := pmetric.NewMetrics()
-		minMaxMetrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
-		// TODO remove this after testing
-		updateMetricTimestamps(exportRequestMetrics, log)
-		// Parse metrics according to logzio naming conventions
-		for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
-			resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
-			// Handle resource attributes conversion
-			resourceAttributes := resourceMetrics.Resource().Attributes()
-			resourceAttributes.Range(func(k string, v pcommon.Value) bool {
-				resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
-				return true
-			})
-			accountId, ok := resourceAttributes.Get("cloud.account.id")
-			if ok {
-				resourceAttributes.PutStr("account", accountId.AsString())
-				resourceAttributes.Remove("cloud.account.id")
-			}
-			region, ok := resourceAttributes.Get("cloud.region")
-			if ok {
-				resourceAttributes.PutStr("region", region.AsString())
-				resourceAttributes.Remove("cloud.region")
-			}
-			resourceAttributes.Remove("aws.exporter.arn")
 
-			for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
-				scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
-				for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
-					sm := scopeMetrics.Metrics().At(k)
-					// Convert metric name to Logz.io naming convention
-					newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(sm.Name(), "/", "_")), "amazonaws.com_", "")
-					sm.SetName(newName)
-					if sm.Summary().DataPoints().Len() > 1 {
-						log.Info("Metric has more than one data point", zap.Field{Key: "metric_name", Type: zapcore.StringType, String: sm.Name()})
-					}
-					for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
-						dp := sm.Summary().DataPoints().At(l)
-						dp.Attributes().Range(func(k string, v pcommon.Value) bool {
-							if k == "Dimensions" {
-								dimensions := v.AsRaw().(map[string]interface{})
-								for dimensionKey, dimensionValue := range dimensions {
-									dp.Attributes().PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
-								}
-								dp.Attributes().Remove(k)
-							} else {
-								dp.Attributes().PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
-								dp.Attributes().Remove(k)
-							}
-							return true
-						})
-						// Create new min max metrics and remove quantiles
-						minMetric := pmetric.NewMetric()
-						minMetric.SetName(sm.Name() + minStr)
-						maxMetric := pmetric.NewMetric()
-						maxMetric.SetName(sm.Name() + maxStr)
-						minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
-						maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
-
-						minDp.SetTimestamp(dp.StartTimestamp())
-						maxDp.SetTimestamp(dp.StartTimestamp())
-						dp.Attributes().Range(func(k string, v pcommon.Value) bool {
-							minDp.Attributes().PutStr(k, v.AsString())
-							maxDp.Attributes().PutStr(k, v.AsString())
-							return true
-						})
-						minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
-						maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
-						minMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
-						maxMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
-
-						// Remove quantiles 0 and 1 that represent min and max
-						dp.QuantileValues().RemoveIf(func(qv pmetric.SummaryDataPointValueAtQuantile) bool {
-							return qv.Quantile() == 0 || qv.Quantile() == 1
-						})
-					}
-				}
-			}
-		}
-		metricsToSend := pmetric.NewMetrics()
-		exportRequestMetrics.ResourceMetrics().MoveAndAppendTo(metricsToSend.ResourceMetrics())
-		minMaxMetrics.ResourceMetrics().MoveAndAppendTo(metricsToSend.ResourceMetrics())
-
-		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(bulkNum)})
+		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(recordIdx)})
 		err = metricsExporter.ConsumeMetrics(ctx, metricsToSend)
 		if err != nil {
 			if strings.Contains(err.Error(), "status 401") {
