@@ -227,6 +227,43 @@ func convertResourceAttributes(resourceAttributes pcommon.Map) {
 	resourceAttributes.Remove("aws.exporter.arn")
 }
 
+func convertAttributes(attributes pcommon.Map) {
+	attributes.Range(func(k string, v pcommon.Value) bool {
+		if k == "Dimensions" {
+			dimensions := v.AsRaw().(map[string]interface{})
+			for dimensionKey, dimensionValue := range dimensions {
+				attributes.PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
+			}
+			attributes.Remove(k)
+		} else {
+			attributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
+			attributes.Remove(k)
+		}
+		return true
+	})
+}
+
+func createMinMaxMetrics(metricName string, dp pmetric.SummaryDataPoint) (pmetric.Metric, pmetric.Metric) {
+	minMetric := pmetric.NewMetric()
+	minMetric.SetName(metricName + minStr)
+	maxMetric := pmetric.NewMetric()
+	maxMetric.SetName(metricName + maxStr)
+	minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+	maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+
+	minDp.SetTimestamp(dp.StartTimestamp())
+	maxDp.SetTimestamp(dp.StartTimestamp())
+	dp.Attributes().Range(func(k string, v pcommon.Value) bool {
+		minDp.Attributes().PutStr(k, v.AsString())
+		maxDp.Attributes().PutStr(k, v.AsString())
+		return true
+	})
+	minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
+	maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
+
+	return minMetric, maxMetric
+}
+
 func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics, error) {
 	protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 	err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
@@ -250,8 +287,7 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 	// Parse metrics according to logzio naming conventions
 	for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
 		resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
-		resourceAttributes := resourceMetrics.Resource().Attributes()
-		convertResourceAttributes(resourceAttributes)
+		convertResourceAttributes(resourceMetrics.Resource().Attributes())
 		for j := 0; j < resourceMetrics.ScopeMetrics().Len(); j++ {
 			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
 			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
@@ -264,40 +300,11 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 				}
 				for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
 					dp := sm.Summary().DataPoints().At(l)
-					dp.Attributes().Range(func(k string, v pcommon.Value) bool {
-						if k == "Dimensions" {
-							dimensions := v.AsRaw().(map[string]interface{})
-							for dimensionKey, dimensionValue := range dimensions {
-								dp.Attributes().PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
-							}
-							dp.Attributes().Remove(k)
-						} else {
-							dp.Attributes().PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
-							dp.Attributes().Remove(k)
-						}
-						return true
-					})
-					// Create new min max metrics and remove quantiles
-					minMetric := pmetric.NewMetric()
-					minMetric.SetName(sm.Name() + minStr)
-					maxMetric := pmetric.NewMetric()
-					maxMetric.SetName(sm.Name() + maxStr)
-					minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
-					maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
-
-					minDp.SetTimestamp(dp.StartTimestamp())
-					maxDp.SetTimestamp(dp.StartTimestamp())
-					dp.Attributes().Range(func(k string, v pcommon.Value) bool {
-						minDp.Attributes().PutStr(k, v.AsString())
-						maxDp.Attributes().PutStr(k, v.AsString())
-						return true
-					})
-					minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
-					maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
+					convertAttributes(dp.Attributes())
+					minMetric, maxMetric := createMinMaxMetrics(sm.Name(), dp)
 					minMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
 					maxMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
-
-					// Remove quantiles 0 and 1 that represent min and max
+					// Remove quantiles 0 and 1 that represent min and max values
 					dp.QuantileValues().RemoveIf(func(qv pmetric.SummaryDataPointValueAtQuantile) bool {
 						return qv.Quantile() == 0 || qv.Quantile() == 1
 					})
@@ -365,10 +372,10 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		}
 
 		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(recordIdx)})
-		err = metricsExporter.ConsumeMetrics(ctx, metricsToSend)
-		if err != nil {
-			if strings.Contains(err.Error(), "status 401") {
-				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", err), nil
+		shippingErr := metricsExporter.ConsumeMetrics(ctx, metricsToSend)
+		if shippingErr != nil {
+			if strings.Contains(shippingErr.Error(), "status 401") {
+				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", shippingErr), nil
 			}
 			shippingErrors.Collect(err)
 		} else {
