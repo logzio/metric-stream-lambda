@@ -10,12 +10,281 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 )
+
+func TestBase64Decode(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+		hasError bool
+	}{
+		{
+			name:     "valid base64 string",
+			input:    "aGVsbG8gd29ybGQ=",
+			expected: "hello world",
+			hasError: false,
+		},
+		{
+			name:     "invalid base64 string",
+			input:    "invalid_base64",
+			expected: "",
+			hasError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := base64Decode(test.input)
+			if test.hasError {
+				assert.Equal(t, true, err)
+			} else {
+				assert.Equal(t, false, err)
+				assert.Equal(t, test.expected, result)
+			}
+		})
+	}
+}
+
+func TestIsDemoData(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{
+			name:     "contains demo data",
+			input:    "TICKER_SYMBOL, SECTOR, CHANGE",
+			expected: true,
+		},
+		{
+			name:     "does not contain demo data",
+			input:    "random data",
+			expected: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isDemoData(test.input)
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+
+func TestGetListenerUrl(t *testing.T) {
+	tests := []struct {
+		name     string
+		region   string
+		expected string
+	}{
+		{
+			name:     "us-east-1 region",
+			region:   "us-east-1",
+			expected: "https://listener.logz.io:8053",
+		},
+		{
+			name:     "ca-central-1 region",
+			region:   "ca-central-1",
+			expected: "https://listener-ca.logz.io:8053",
+		},
+		{
+			name:     "unsupported region",
+			region:   "unsupported-region",
+			expected: "https://listener.logz.io:8053",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			os.Setenv("AWS_REGION", test.region)
+			log := zap.NewNop()
+			result := getListenerUrl(*log)
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+
+func TestExtractHeaders(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         events.APIGatewayProxyRequest
+		expectedReqId string
+		expectedToken string
+	}{
+		{
+			name: "valid headers",
+			input: events.APIGatewayProxyRequest{
+				Headers: map[string]string{
+					"X-Amz-Firehose-Request-Id": "request-id",
+					"X-Amz-Firehose-Access-Key": "access-key",
+				},
+			},
+			expectedReqId: "request-id",
+			expectedToken: "access-key",
+		},
+		{
+			name: "missing headers",
+			input: events.APIGatewayProxyRequest{
+				Headers: map[string]string{},
+			},
+			expectedReqId: "",
+			expectedToken: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reqId, token := extractHeaders(test.input)
+			assert.Equal(t, test.expectedReqId, reqId)
+			assert.Equal(t, test.expectedToken, token)
+		})
+	}
+}
+
+func TestConvertResourceAttributes(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    pcommon.Map
+		expected pcommon.Map
+	}{
+		{
+			name: "convert attributes",
+			input: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutStr("cloud.account.id", "12345")
+				m.PutStr("cloud.region", "us-east-1")
+				m.PutStr("aws.exporter.arn", "arn:aws:...")
+				m.PutStr("OTHER_KEY", "value")
+				return m
+			}(),
+			expected: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutStr("account", "12345")
+				m.PutStr("region", "us-east-1")
+				m.PutStr("other_key", "value")
+				return m
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			convertResourceAttributes(test.input)
+			assert.Equal(t, test.expected.AsRaw(), test.input.AsRaw())
+		})
+	}
+}
+
+func TestConvertAttributes(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    pcommon.Map
+		expected pcommon.Map
+	}{
+		{
+			name: "convert dimensions",
+			input: func() pcommon.Map {
+				m := pcommon.NewMap()
+				dimensions := map[string]interface{}{
+					"Dimension1": "Value1",
+					"Dimension2": "Value2",
+				}
+				m.PutEmptyMap("Dimensions").FromRaw(dimensions)
+				return m
+			}(),
+			expected: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutStr("dimension1", "value1")
+				m.PutStr("dimension2", "value2")
+				return m
+			}(),
+		},
+		{
+			name: "convert attributes",
+			input: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutStr("Attribute1", "Value1")
+				m.PutStr("Attribute2", "Value2")
+				return m
+			}(),
+			expected: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutStr("attribute1", "value1")
+				m.PutStr("attribute2", "value2")
+				return m
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			convertAttributes(test.input)
+			assert.Equal(t, test.expected.AsRaw(), test.input.AsRaw())
+		})
+	}
+}
+
+func TestCreateMinMaxMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		metricName string
+		quantiles  []float64
+		attributes map[string]string
+	}{
+		{
+			name:       "single quantile",
+			metricName: "test_metric",
+			quantiles:  []float64{1.0, 5.0},
+			attributes: map[string]string{"key": "value"},
+		},
+		{
+			name:       "multiple quantiles",
+			metricName: "test_metric_multiple",
+			quantiles:  []float64{0.5, 2.5, 4.5},
+			attributes: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dp := pmetric.NewSummaryDataPoint()
+			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+			for _, q := range test.quantiles {
+				dp.QuantileValues().AppendEmpty().SetValue(q)
+			}
+			for k, v := range test.attributes {
+				dp.Attributes().PutStr(k, v)
+			}
+
+			minMetric, maxMetric := createMinMaxMetrics(test.metricName, dp)
+
+			assert.Equal(t, test.metricName+minStr, minMetric.Name())
+			assert.Equal(t, test.metricName+maxStr, maxMetric.Name())
+			if len(test.quantiles) > 0 {
+				assert.Equal(t, test.quantiles[0], minMetric.Gauge().DataPoints().At(0).DoubleValue())
+				assert.Equal(t, test.quantiles[len(test.quantiles)-1], maxMetric.Gauge().DataPoints().At(0).DoubleValue())
+			}
+			assert.Equal(t, dp.StartTimestamp(), minMetric.Gauge().DataPoints().At(0).Timestamp())
+			assert.Equal(t, dp.StartTimestamp(), maxMetric.Gauge().DataPoints().At(0).Timestamp())
+			for k, v := range test.attributes {
+				minExpectedValue, _ := minMetric.Gauge().DataPoints().At(0).Attributes().Get(k)
+				maxExpectedValue, _ := maxMetric.Gauge().DataPoints().At(0).Attributes().Get(k)
+				assert.Equal(t, v, minExpectedValue.AsString())
+				assert.Equal(t, v, maxExpectedValue.AsString())
+			}
+		})
+	}
+}
 
 func TestHandleRequestOTLP10(t *testing.T) {
 	jsonFile, err := os.Open("../testdata/otlp-1.0/validEvent.json")
@@ -112,58 +381,6 @@ func TestHandleRequestErrors(t *testing.T) {
 	}
 }
 
-//func TestCreateMetricFromAttributes(t *testing.T) {
-//	expected := pmetric.NewMetric()
-//	expected.SetUnit("test_unit")
-//	expected.SetName("test_name_suffix")
-//	expected.SetDataType(pdata.MetricDataTypeDoubleSum)
-//	expected.DoubleSum().SetAggregationTemporality(pdata.AggregationTemporalityCumulative)
-//
-//	metric := pdata.NewMetric()
-//	metric.SetUnit("test_unit")
-//	metric.SetName("test_name")
-//	metric.SetDataType(pdata.MetricDataTypeSummary)
-//
-//	result := createMetricFromAttributes(metric, "_suffix")
-//	if result.Name() != expected.Name() {
-//		t.Fatalf("Name does not match %s != %s", result.Name(), expected.Name())
-//	}
-//	if result.DataType() != expected.DataType() {
-//		t.Fatalf("DataType does not match %s != %s", result.DataType(), expected.DataType())
-//	}
-//	if result.Unit() != expected.Unit() {
-//		t.Fatalf("Unit does not match %s != %s", result.Unit(), expected.Unit())
-//	}
-//	if result.DoubleSum().AggregationTemporality() != expected.DoubleSum().AggregationTemporality() {
-//		t.Fatalf("AggregationTemporality does not match %s != %s", result.DoubleSum().AggregationTemporality(), expected.DoubleSum().AggregationTemporality())
-//	}
-//}
-
-//	func TestGetListenerUrl(t *testing.T) {
-//		type getListenerUrlTest struct {
-//			region   string
-//			expected string
-//		}
-//		var getListenerUrlTests = []getListenerUrlTest{
-//			{"us-east-1", "https://listener.logz.io:8053"},
-//			{"ca-central-1", "https://listener-ca.logz.io:8053"},
-//			{"eu-central-1", "https://listener-eu.logz.io:8053"},
-//			{"eu-west-2", "https://listener-uk.logz.io:8053"},
-//			{"ap-southeast-2", "https://listener-au.logz.io:8053"},
-//			{"", "https://listener.logz.io:8053"},
-//			{"not-valid", "https://listener.logz.io:8053"},
-//		}
-//		config := zap.NewProductionConfig()
-//		logger, configErr := config.Build()
-//		if configErr != nil {
-//			log_old.Fatal(configErr)
-//		}
-//		for _, test := range getListenerUrlTests {
-//			os.Setenv("AWS_REGION", test.region)
-//			output := getListenerUrl(*logger.Sugar())
-//			require.Equal(t, output, test.expected)
-//		}
-//	}
 func TestRemoveDuplicateValues(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -194,30 +411,3 @@ func TestRemoveDuplicateValues(t *testing.T) {
 		})
 	}
 }
-
-//func TestSummaryValuesToMetrics(t *testing.T) {
-//	testMetric := pmetric.NewMetric()
-//	testMetric.set
-//	testMetric.SetDataType(pdata.MetricDataTypeSummary)
-//	testMetric.SetName("test")
-//	testDp := testMetric.Summary().DataPoints().AppendEmpty()
-//	testDp.SetCount(2)
-//	testDp.SetSum(10)
-//	testQuantiles := testDp.QuantileValues()
-//	testQuantileMax := testQuantiles.AppendEmpty()
-//	testQuantileMax.SetValue(8)
-//	testQuantileMax.SetQuantile(1)
-//	testQuantileMin := testQuantiles.AppendEmpty()
-//	testQuantileMin.SetValue(0)
-//	testQuantileMin.SetQuantile(0)
-//	testQuantile99 := testQuantiles.AppendEmpty()
-//	testQuantile99.SetValue(6)
-//	testQuantile99.SetQuantile(0.99)
-//	testResourceAttributes := pdata.NewAttributeMap()
-//	testResourceAttributes.Insert("k", pdata.NewAttributeValueInt(1))
-//	testMetricsToSend := pdata.NewMetrics()
-//	testAggregatedInstrumentationLibraryMetrics := testMetricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
-//	summaryValuesToMetrics(testAggregatedInstrumentationLibraryMetrics, testMetric, testResourceAttributes)
-//	assert.Equal(t, 5, testAggregatedInstrumentationLibraryMetrics.Len())
-//
-//}
