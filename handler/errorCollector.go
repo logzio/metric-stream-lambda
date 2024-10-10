@@ -5,14 +5,14 @@ import (
 	"fmt"
 )
 
-type ErrorCollector []error
+type errorCollector []error
 
-func (c *ErrorCollector) Collect(e error) { *c = append(*c, e) }
+func (c *errorCollector) Collect(e error) { *c = append(*c, e) }
 
-func (c *ErrorCollector) Length() int {
+func (c *errorCollector) Length() int {
 	return len(*c)
 }
-func (c *ErrorCollector) Error() error {
+func (c *errorCollector) Error() error {
 	err := "Collected errors:\n"
 	for i, e := range *c {
 		err += fmt.Sprintf("\tError %d: %s\n", i, e.Error())

@@ -216,7 +216,7 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (e
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	metricCount := 0
 	dataPointCount := 0
-	shippingErrors := new(ErrorCollector)
+	shippingErrors := new(errorCollector)
 	requestId, LogzioToken := extractHeaders(request)
 	log := initLogger(ctx, request, LogzioToken)
 	firehoseResponseClient := newResponseClient(requestId, log)
