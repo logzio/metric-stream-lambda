@@ -258,9 +258,6 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 				sm := scopeMetrics.Metrics().At(k)
 				newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(sm.Name(), "/", "_")), "amazonaws.com_", "")
 				sm.SetName(newName)
-				if sm.Summary().DataPoints().Len() > 1 {
-					log.Info("Metric has more than one data point", zap.String("metric_name", sm.Name()))
-				}
 				for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
 					dp := sm.Summary().DataPoints().At(l)
 					convertAttributes(dp.Attributes())
