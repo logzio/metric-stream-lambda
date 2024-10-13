@@ -2,5 +2,5 @@ build:
 	go build main.go
 
 function:
-	GOARCH=amd64 GOOS=linux go build -o bootstrap main.go
-	zip -r function.zip bootstrap
+	GOOS=linux GOARCH=amd64 go build -tags lambda.norpc -o bootstrap main.go
+	zip myFunction.zip bootstrap
