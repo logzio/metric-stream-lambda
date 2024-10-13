@@ -120,17 +120,20 @@ func TestExtractHeaders(t *testing.T) {
 		input         events.APIGatewayProxyRequest
 		expectedReqId string
 		expectedToken string
+		expectedEnvID string
 	}{
 		{
 			name: "valid headers",
 			input: events.APIGatewayProxyRequest{
 				Headers: map[string]string{
-					"X-Amz-Firehose-Request-Id": "request-id",
-					"X-Amz-Firehose-Access-Key": "access-key",
+					"X-Amz-Firehose-Request-Id":        "request-id",
+					"X-Amz-Firehose-Access-Key":        "access-key",
+					"X-Amz-Firehose-Common-Attributes": `{"commonAttributes":{"p8s_logzio_name":"env-id"}}`,
 				},
 			},
 			expectedReqId: "request-id",
 			expectedToken: "access-key",
+			expectedEnvID: "env-id",
 		},
 		{
 			name: "missing headers",
@@ -139,18 +142,19 @@ func TestExtractHeaders(t *testing.T) {
 			},
 			expectedReqId: "",
 			expectedToken: "",
+			expectedEnvID: "",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			reqId, token := extractHeaders(test.input)
+			reqId, token, envID := extractHeaders(test.input)
 			assert.Equal(t, test.expectedReqId, reqId)
 			assert.Equal(t, test.expectedToken, token)
+			assert.Equal(t, test.expectedEnvID, envID)
 		})
 	}
 }
-
 func TestConvertResourceAttributes(t *testing.T) {
 	tests := []struct {
 		name     string
