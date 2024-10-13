@@ -108,7 +108,7 @@ func TestGetListenerUrl(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			os.Setenv("AWS_REGION", test.region)
 			log := zap.NewNop()
-			result := getListenerUrl(*log)
+			result := getListenerUrl(log)
 			assert.Equal(t, test.expected, result)
 		})
 	}
@@ -169,6 +169,7 @@ func TestConvertResourceAttributes(t *testing.T) {
 				m.PutStr("cloud.region", "us-east-1")
 				m.PutStr("aws.exporter.arn", "arn:aws:...")
 				m.PutStr("OTHER_KEY", "value")
+				m.PutStr("TestAttribute", "value")
 				return m
 			}(),
 			expected: func() pcommon.Map {
@@ -176,6 +177,8 @@ func TestConvertResourceAttributes(t *testing.T) {
 				m.PutStr("account", "12345")
 				m.PutStr("region", "us-east-1")
 				m.PutStr("other_key", "value")
+				m.PutStr("testattribute", "value")
+
 				return m
 			}(),
 		},
@@ -270,7 +273,7 @@ func TestCreateMinMaxMetrics(t *testing.T) {
 				dp.Attributes().PutStr(k, v)
 			}
 
-			minMetric, maxMetric := createMinMaxMetrics(test.metricName, dp)
+			minMetric, maxMetric := createMinMaxMetrics(test.metricName, dp, pcommon.NewMap())
 
 			assert.Equal(t, test.metricName+minStr, minMetric.Name())
 			assert.Equal(t, test.metricName+maxStr, maxMetric.Name())
