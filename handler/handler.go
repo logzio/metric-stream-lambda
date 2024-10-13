@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/golang/protobuf/proto"
@@ -26,10 +30,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"os"
-	"strings"
-	"time"
 )
 
 const (
@@ -40,15 +40,11 @@ const (
 )
 
 func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) *zap.Logger {
-	awsRequestId := ""
-	account := ""
-	logzioIdentifier := ""
-	lambdaContext, ok := lambdacontext.FromContext(ctx)
-	if ok {
+	awsRequestId, account, logzioIdentifier := "", "", ""
+	if lambdaContext, ok := lambdacontext.FromContext(ctx); ok {
 		awsRequestId = lambdaContext.AwsRequestID
 	}
-	awsAccount := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":")
-	if len(awsAccount) > 4 {
+	if awsAccount := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":"); len(awsAccount) > 4 {
 		account = awsAccount[4]
 	}
 	if len(token) >= 5 {
@@ -56,8 +52,8 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, toke
 	}
 	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	config := zap.NewProductionConfig()
-	config.EncoderConfig.StacktraceKey = "" // to hide stacktrace info
-	config.OutputPaths = []string{"stdout"} // write to stdout
+	config.EncoderConfig.StacktraceKey = ""
+	config.OutputPaths = []string{"stdout"}
 	config.InitialFields = map[string]interface{}{
 		"aws_account":               account,
 		"lambda_invocation_id":      awsRequestId,
@@ -72,7 +68,6 @@ func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, toke
 	return logger
 }
 
-// Takes a base64 encoded string and returns decoded string
 func base64Decode(str string) (string, bool) {
 	data, err := base64.StdEncoding.DecodeString(str)
 	if err != nil {
@@ -80,6 +75,7 @@ func base64Decode(str string) (string, bool) {
 	}
 	return string(data), false
 }
+
 func removeDuplicateValues(intSlice []string) []string {
 	keys := make(map[string]bool)
 	var list []string
@@ -92,17 +88,11 @@ func removeDuplicateValues(intSlice []string) []string {
 	return list
 }
 
-// isDemoData checks if the payload is kinesis demo data
 func isDemoData(rawData string) bool {
-	if strings.Contains(rawData, "TICKER_SYMBOL") && strings.Contains(rawData, "SECTOR") && strings.Contains(rawData, "CHANGE") {
-		return true
-	}
-	return false
+	return strings.Contains(rawData, "TICKER_SYMBOL") && strings.Contains(rawData, "SECTOR") && strings.Contains(rawData, "CHANGE")
 }
 
-// Generates logzio listener url based on aws region
-func getListenerUrl(log zap.Logger) string {
-	// reserved lambda environment variable AWS_REGION https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
+func getListenerUrl(log *zap.Logger) string {
 	switch awsRegion := os.Getenv("AWS_REGION"); awsRegion {
 	case "us-east-1":
 		return "https://listener.logz.io:8053"
@@ -115,7 +105,7 @@ func getListenerUrl(log zap.Logger) string {
 	case "ap-southeast-2":
 		return "https://listener-au.logz.io:8053"
 	default:
-		log.Info("Region is not supported yet, setting url to default value", zap.Field{Key: "region", Type: zapcore.StringType, String: awsRegion})
+		log.Info("Region is not supported yet, setting url to default value", zap.String("region", awsRegion))
 		return "https://listener.logz.io:8053"
 	}
 }
@@ -134,34 +124,23 @@ func extractHeaders(request events.APIGatewayProxyRequest) (string, string, stri
 		commonAttributes = request.Headers["x-amz-firehose-common-attributes"]
 	}
 	var commonAttributesMap map[string]interface{}
-	err := json.Unmarshal([]byte(commonAttributes), &commonAttributesMap)
-	if err != nil {
+	if err := json.Unmarshal([]byte(commonAttributes), &commonAttributesMap); err != nil {
 		return "", "", ""
 	}
 	envID := commonAttributesMap["commonAttributes"].(map[string]interface{})["p8s_logzio_name"].(string)
 	fmt.Println("Common attributes: ", commonAttributesMap)
-
 	return requestId, logzioToken, envID
 }
 
-func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string, envId string) (exporter.Metrics, error) {
+func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken, envId string) (exporter.Metrics, error) {
 	cfg := &prometheusremotewriteexporter.Config{
-		Namespace:      "",
 		ExternalLabels: map[string]string{"p8s_logzio_name": envId},
 		ClientConfig: confighttp.ClientConfig{
-			Endpoint: getListenerUrl(*log),
+			Endpoint: getListenerUrl(log),
 			Timeout:  5 * time.Second,
 			Headers:  map[string]configopaque.String{"Authorization": configopaque.String(fmt.Sprintf("Bearer %s", LogzioToken))},
 		},
-		ResourceToTelemetrySettings: resourcetotelemetry.Settings{
-			Enabled: true,
-		},
-		TargetInfo: &prometheusremotewriteexporter.TargetInfo{
-			Enabled: false,
-		},
-		CreatedMetric: &prometheusremotewriteexporter.CreatedMetric{
-			Enabled: false,
-		},
+		ResourceToTelemetrySettings: resourcetotelemetry.Settings{Enabled: true},
 		RemoteWriteQueue: prometheusremotewriteexporter.RemoteWriteQueue{
 			Enabled:      true,
 			NumConsumers: 3,
@@ -183,11 +162,7 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string, en
 			Version:     "1.0",
 		},
 	}
-	metricsExporter, err := prometheusremotewriteexporter.NewFactory().CreateMetricsExporter(context.Background(), settings, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return metricsExporter, nil
+	return prometheusremotewriteexporter.NewFactory().CreateMetricsExporter(context.Background(), settings, cfg)
 }
 
 func convertResourceAttributes(resourceAttributes pcommon.Map) {
@@ -195,13 +170,11 @@ func convertResourceAttributes(resourceAttributes pcommon.Map) {
 		resourceAttributes.PutStr(strings.ToLower(k), strings.ToLower(v.AsString()))
 		return true
 	})
-	accountId, ok := resourceAttributes.Get(cloudAccountIdAtt)
-	if ok {
+	if accountId, ok := resourceAttributes.Get(cloudAccountIdAtt); ok {
 		resourceAttributes.PutStr("account", accountId.AsString())
 		resourceAttributes.Remove(cloudAccountIdAtt)
 	}
-	region, ok := resourceAttributes.Get(cloudRegionAtt)
-	if ok {
+	if region, ok := resourceAttributes.Get(cloudRegionAtt); ok {
 		resourceAttributes.PutStr("region", region.AsString())
 		resourceAttributes.Remove(cloudRegionAtt)
 	}
@@ -211,8 +184,7 @@ func convertResourceAttributes(resourceAttributes pcommon.Map) {
 func convertAttributes(attributes pcommon.Map) {
 	attributes.Range(func(k string, v pcommon.Value) bool {
 		if k == "Dimensions" {
-			dimensions := v.AsRaw().(map[string]interface{})
-			for dimensionKey, dimensionValue := range dimensions {
+			for dimensionKey, dimensionValue := range v.AsRaw().(map[string]interface{}) {
 				attributes.PutStr(strings.ToLower(dimensionKey), strings.ToLower(dimensionValue.(string)))
 			}
 			attributes.Remove(k)
@@ -231,7 +203,6 @@ func createMinMaxMetrics(metricName string, dp pmetric.SummaryDataPoint) (pmetri
 	maxMetric.SetName(metricName + maxStr)
 	minDp := minMetric.SetEmptyGauge().DataPoints().AppendEmpty()
 	maxDp := maxMetric.SetEmptyGauge().DataPoints().AppendEmpty()
-
 	minDp.SetTimestamp(dp.StartTimestamp())
 	maxDp.SetTimestamp(dp.StartTimestamp())
 	dp.Attributes().Range(func(k string, v pcommon.Value) bool {
@@ -241,14 +212,12 @@ func createMinMaxMetrics(metricName string, dp pmetric.SummaryDataPoint) (pmetri
 	})
 	minDp.SetDoubleValue(dp.QuantileValues().At(0).Value())
 	maxDp.SetDoubleValue(dp.QuantileValues().At(dp.QuantileValues().Len() - 1).Value())
-
 	return minMetric, maxMetric
 }
 
 func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics, error) {
 	protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
-	err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest)
-	if err != nil {
+	if err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest); err != nil {
 		return pmetric.Metrics{}, err
 	}
 	protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
@@ -256,14 +225,12 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 		return pmetric.Metrics{}, marshalErr
 	}
 	exportRequest := pmetricotlp.NewExportRequest()
-	err = exportRequest.UnmarshalProto(protoBytes)
-	if err != nil {
+	if err := exportRequest.UnmarshalProto(protoBytes); err != nil {
 		return pmetric.Metrics{}, err
 	}
 	exportRequestMetrics := exportRequest.Metrics()
 	minMaxMetrics := pmetric.NewMetrics()
 	minMaxMetrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
-	// Parse metrics according to logzio naming conventions
 	for i := 0; i < exportRequestMetrics.ResourceMetrics().Len(); i++ {
 		resourceMetrics := exportRequestMetrics.ResourceMetrics().At(i)
 		convertResourceAttributes(resourceMetrics.Resource().Attributes())
@@ -271,11 +238,10 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 			scopeMetrics := resourceMetrics.ScopeMetrics().At(j)
 			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
 				sm := scopeMetrics.Metrics().At(k)
-				// Convert metric name to Logz.io naming convention
 				newName := strings.ReplaceAll(strings.ToLower(strings.ReplaceAll(sm.Name(), "/", "_")), "amazonaws.com_", "")
 				sm.SetName(newName)
 				if sm.Summary().DataPoints().Len() > 1 {
-					log.Info("Metric has more than one data point", zap.Field{Key: "metric_name", Type: zapcore.StringType, String: sm.Name()})
+					log.Info("Metric has more than one data point", zap.String("metric_name", sm.Name()))
 				}
 				for l := 0; l < sm.Summary().DataPoints().Len(); l++ {
 					dp := sm.Summary().DataPoints().At(l)
@@ -283,7 +249,6 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 					minMetric, maxMetric := createMinMaxMetrics(sm.Name(), dp)
 					minMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
 					maxMetric.CopyTo(minMaxMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty())
-					// Remove quantiles 0 and 1 that represent min and max values
 					dp.QuantileValues().RemoveIf(func(qv pmetric.SummaryDataPointValueAtQuantile) bool {
 						return qv.Quantile() == 0 || qv.Quantile() == 1
 					})
@@ -296,8 +261,7 @@ func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics,
 }
 
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	metricCount := 0
-	dataPointCount := 0
+	metricCount, dataPointCount := 0, 0
 	shippingErrors := new(internal.ErrorCollector)
 	requestId, LogzioToken, envid := extractHeaders(request)
 	log := initLogger(ctx, request, LogzioToken)
@@ -312,31 +276,14 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	if err != nil {
 		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while creating metrics exporter:", err), nil
 	}
-	err = metricsExporter.Start(ctx, componenttest.NewNopHost())
-	if err != nil {
+	if err := metricsExporter.Start(ctx, componenttest.NewNopHost()); err != nil {
 		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while starting metrics exporter:", err), nil
 	}
 	log.Info("Starting to parse request body")
 	var body map[string]interface{}
-	err = json.Unmarshal([]byte(request.Body), &body)
-	if err != nil {
+	if err := json.Unmarshal([]byte(request.Body), &body); err != nil {
 		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while unmarshalling request body:", err), nil
 	}
-	/*
-		api request body example structure:
-		{
-		  "requestId": string,
-		  "timestamp": int,
-		  "records": [
-		    {
-		      "data": base 64 encoded string
-		    },
-		     {
-		      "data": base 64 encoded string
-		    },
-		  ]
-		}
-	*/
 	records := body["records"].([]interface{})
 	for recordIdx, record := range records {
 		data := record.(map[string]interface{})["data"].(string)
@@ -349,10 +296,8 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		if err != nil {
 			return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error processing record:", err), nil
 		}
-
-		log.Info("Sending metrics", zap.Field{Key: "bulk_number", Type: zapcore.Int64Type, Integer: int64(recordIdx)})
-		shippingErr := metricsExporter.ConsumeMetrics(ctx, metricsToSend)
-		if shippingErr != nil {
+		log.Info("Sending metrics", zap.Int64("bulk_number", int64(recordIdx)))
+		if shippingErr := metricsExporter.ConsumeMetrics(ctx, metricsToSend); shippingErr != nil {
 			if strings.Contains(shippingErr.Error(), "status 401") {
 				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", shippingErr), nil
 			}
@@ -362,10 +307,9 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			dataPointCount += metricsToSend.DataPointCount()
 		}
 	}
-	log.Info("Found metrics with data points", zap.Field{Key: "metric_count", Type: zapcore.Int64Type, Integer: int64(metricCount)}, zap.Field{Key: "datapoint_count", Type: zapcore.Int64Type, Integer: int64(dataPointCount)})
+	log.Info("Found metrics with data points", zap.Int64("metric_count", int64(metricCount)), zap.Int64("datapoint_count", int64(dataPointCount)))
 	log.Info("Shutting down metrics exporter")
-	err = metricsExporter.Shutdown(ctx)
-	if err != nil {
+	if err := metricsExporter.Shutdown(ctx); err != nil {
 		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while shutting down exporter:", err), nil
 	}
 	if shippingErrors.Length() > 0 {
