@@ -120,22 +120,34 @@ func getListenerUrl(log zap.Logger) string {
 	}
 }
 
-func extractHeaders(request events.APIGatewayProxyRequest) (string, string) {
+func extractHeaders(request events.APIGatewayProxyRequest) (string, string, string) {
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	if requestId == "" {
 		requestId = request.Headers["x-amz-firehose-request-id"]
 	}
-	LogzioToken := request.Headers["X-Amz-Firehose-Access-Key"]
-	if LogzioToken == "" {
-		LogzioToken = request.Headers["x-amz-firehose-access-key"]
+	logzioToken := request.Headers["X-Amz-Firehose-Access-Key"]
+	if logzioToken == "" {
+		logzioToken = request.Headers["x-amz-firehose-access-key"]
 	}
-	return requestId, LogzioToken
+	commonAttributes := request.Headers["X-Amz-Firehose-Common-Attributes"]
+	if commonAttributes == "" {
+		commonAttributes = request.Headers["x-amz-firehose-common-attributes"]
+	}
+	var commonAttributesMap map[string]interface{}
+	err := json.Unmarshal([]byte(commonAttributes), &commonAttributesMap)
+	if err != nil {
+		return "", "", ""
+	}
+	envID := commonAttributesMap["commonAttributes"].(map[string]interface{})["p8s_logzio_name"].(string)
+	fmt.Println("Common attributes: ", commonAttributesMap)
+
+	return requestId, logzioToken, envID
 }
 
-func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string) (exporter.Metrics, error) {
+func createPrometheusRemoteWriteExporter(log *zap.Logger, LogzioToken string, envId string) (exporter.Metrics, error) {
 	cfg := &prometheusremotewriteexporter.Config{
 		Namespace:      "",
-		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-1"},
+		ExternalLabels: map[string]string{"p8s_logzio_name": envId},
 		ClientConfig: confighttp.ClientConfig{
 			Endpoint: getListenerUrl(*log),
 			Timeout:  5 * time.Second,
@@ -287,7 +299,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	metricCount := 0
 	dataPointCount := 0
 	shippingErrors := new(internal.ErrorCollector)
-	requestId, LogzioToken := extractHeaders(request)
+	requestId, LogzioToken, envid := extractHeaders(request)
 	log := initLogger(ctx, request, LogzioToken)
 	firehoseResponseClient := internal.NewResponseClient(requestId, log)
 	defer log.Sync()
@@ -296,7 +308,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		log.Error(accessKeyErr.Error())
 		return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error while getting access keys:", accessKeyErr), nil
 	}
-	metricsExporter, err := createPrometheusRemoteWriteExporter(log, LogzioToken)
+	metricsExporter, err := createPrometheusRemoteWriteExporter(log, LogzioToken, envid)
 	if err != nil {
 		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while creating metrics exporter:", err), nil
 	}
