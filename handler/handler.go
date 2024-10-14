@@ -44,27 +44,27 @@ type handlerConfig struct {
 	EnvId       string
 	url         string
 	RequestId   string
+	FirehoseArn string
 }
 
-func initLogger(ctx context.Context, request events.APIGatewayProxyRequest, token string) *zap.Logger {
+func initLogger(ctx context.Context, handlerCfg handlerConfig) *zap.Logger {
 	awsRequestId, account, logzioIdentifier := "", "", ""
 	if lambdaContext, ok := lambdacontext.FromContext(ctx); ok {
 		awsRequestId = lambdaContext.AwsRequestID
 	}
-	if arnStr := strings.Split(request.Headers["X-Amz-Firehose-Source-Arn"], ":"); len(arnStr) > 4 {
+	if arnStr := strings.Split(handlerCfg.FirehoseArn, ":"); len(arnStr) > 4 {
 		account = arnStr[4]
 	}
-	if len(token) >= 5 {
-		logzioIdentifier = token[len(token)-5:]
+	if len(handlerCfg.LogzioToken) >= 5 {
+		logzioIdentifier = handlerCfg.LogzioToken[len(handlerCfg.LogzioToken)-5:]
 	}
-	firehoseRequestId := request.Headers["X-Amz-Firehose-Request-Id"]
 	config := zap.NewProductionConfig()
 	config.EncoderConfig.StacktraceKey = ""
 	config.OutputPaths = []string{"stdout"}
 	config.InitialFields = map[string]interface{}{
 		"aws_account":               account,
 		"lambda_invocation_id":      awsRequestId,
-		"firehose_request_id":       firehoseRequestId,
+		"firehose_request_id":       handlerCfg.RequestId,
 		"logzio_account_identifier": logzioIdentifier,
 	}
 	logger, configErr := config.Build()
@@ -129,6 +129,11 @@ func extractHeaders(request events.APIGatewayProxyRequest) handlerConfig {
 		logzioToken = request.Headers["x-amz-firehose-access-key"]
 	}
 	config.LogzioToken = logzioToken
+	firehoseArn := request.Headers["X-Amz-Firehose-Source-Arn"]
+	if firehoseArn == "" {
+		firehoseArn = request.Headers["x-amz-firehose-source-arn"]
+	}
+	config.FirehoseArn = firehoseArn
 	commonAttributes := request.Headers["X-Amz-Firehose-Common-Attributes"]
 	if commonAttributes == "" {
 		commonAttributes = request.Headers["x-amz-firehose-common-attributes"]
@@ -301,7 +306,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	metricCount, dataPointCount := 0, 0
 	shippingErrors := new(internal.ErrorCollector)
 	handlerCfg := extractHeaders(request)
-	log := initLogger(ctx, request, handlerCfg.LogzioToken)
+	log := initLogger(ctx, handlerCfg)
 	firehoseResponseClient := internal.NewResponseClient(handlerCfg.RequestId, log)
 	defer log.Sync()
 	if handlerCfg.LogzioToken == "" {
