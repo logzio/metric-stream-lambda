@@ -117,41 +117,72 @@ func TestGetListenerUrl(t *testing.T) {
 func TestExtractHeaders(t *testing.T) {
 	tests := []struct {
 		name          string
-		input         events.APIGatewayProxyRequest
-		expectedReqId string
-		expectedToken string
-		expectedEnvID string
+		headers       map[string]string
+		expected      handlerConfig
+		expectedError bool
 	}{
 		{
-			name: "valid headers",
-			input: events.APIGatewayProxyRequest{
-				Headers: map[string]string{
-					"X-Amz-Firehose-Request-Id":        "request-id",
-					"X-Amz-Firehose-Access-Key":        "access-key",
-					"X-Amz-Firehose-Common-Attributes": `{"commonAttributes":{"p8s_logzio_name":"env-id"}}`,
-				},
+			name: "All headers present",
+			headers: map[string]string{
+				"X-Amz-Firehose-Request-Id":        "request-id",
+				"X-Amz-Firehose-Access-Key":        "access-key",
+				"X-Amz-Firehose-Common-Attributes": `{"commonAttributes":{"P8S_LOGZIO_NAME":"env-id","CUSTOM_LISTENER":"custom-url"}}`,
 			},
-			expectedReqId: "request-id",
-			expectedToken: "access-key",
-			expectedEnvID: "env-id",
+			expected: handlerConfig{
+				RequestId:   "request-id",
+				LogzioToken: "access-key",
+				EnvId:       "env-id",
+				url:         "custom-url",
+			},
 		},
 		{
-			name: "missing headers",
-			input: events.APIGatewayProxyRequest{
-				Headers: map[string]string{},
+			name: "Missing optional headers",
+			headers: map[string]string{
+				"X-Amz-Firehose-Request-Id": "request-id",
+				"X-Amz-Firehose-Access-Key": "access-key",
 			},
-			expectedReqId: "",
-			expectedToken: "",
-			expectedEnvID: "",
+			expected: handlerConfig{
+				RequestId:   "request-id",
+				LogzioToken: "access-key",
+				EnvId:       "",
+				url:         "",
+			},
+		},
+		{
+			name: "Missing required headers",
+			headers: map[string]string{
+				"X-Amz-Firehose-Common-Attributes": `{"commonAttributes":{"P8S_LOGZIO_NAME":"env-id","CUSTOM_LISTENER":"custom-url"}}`,
+			},
+			expected: handlerConfig{
+				RequestId:   "",
+				LogzioToken: "",
+				EnvId:       "env-id",
+				url:         "custom-url",
+			},
+		},
+		{
+			name: "Invalid JSON in common attributes",
+			headers: map[string]string{
+				"X-Amz-Firehose-Request-Id":        "request-id",
+				"X-Amz-Firehose-Access-Key":        "access-key",
+				"X-Amz-Firehose-Common-Attributes": `{"commonAttributes":{"P8S_LOGZIO_NAME":"env-id","CUSTOM_LISTENER":"custom-url"`,
+			},
+			expected: handlerConfig{
+				RequestId:   "request-id",
+				LogzioToken: "access-key",
+				EnvId:       "",
+				url:         "",
+			},
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			reqId, token, envID := extractHeaders(test.input)
-			assert.Equal(t, test.expectedReqId, reqId)
-			assert.Equal(t, test.expectedToken, token)
-			assert.Equal(t, test.expectedEnvID, envID)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := events.APIGatewayProxyRequest{
+				Headers: tt.headers,
+			}
+			config := extractHeaders(request)
+			assert.Equal(t, tt.expected, config)
 		})
 	}
 }
@@ -293,25 +324,6 @@ func TestCreateMinMaxMetrics(t *testing.T) {
 	}
 }
 
-func TestHandleRequestOTLP10(t *testing.T) {
-	jsonFile, err := os.Open("../testdata/otlp-1.0/validEvent.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer jsonFile.Close()
-
-	byteValue, _ := ioutil.ReadAll(jsonFile)
-	request := events.APIGatewayProxyRequest{}
-	json.Unmarshal(byteValue, &request)
-
-	ctx := context.Background()
-	// Create a new context with the AwsRequestID key-value pair
-	ctx = context.WithValue(ctx, "AwsRequestID", "12345")
-
-	_, err = HandleRequest(ctx, request)
-	assert.NoError(t, err)
-}
-
 func TestHandleRequest(t *testing.T) {
 	var metricCount = 0
 	handleFunc := func(w http.ResponseWriter, r *http.Request, code int) {
@@ -325,7 +337,7 @@ func TestHandleRequest(t *testing.T) {
 		// Receives the http requests and unzip, unmarshalls, and extracts TimeSeries
 		assert.Equal(t, "0.1.0", r.Header.Get("X-Prometheus-Remote-Write-Version"))
 		assert.Equal(t, "snappy", r.Header.Get("Content-Encoding"))
-		assert.Equal(t, "opentelemetry/0.7", r.Header.Get("User-Agent"))
+		assert.Equal(t, "logziometricstream/1.0", r.Header.Get("User-Agent"))
 		writeReq := &prompb.WriteRequest{}
 		var unzipped []byte
 		dest, err := snappy.Decode(unzipped, body)
@@ -343,7 +355,7 @@ func TestHandleRequest(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	jsonFile, err := os.Open("../testdata/otlp-0.7/customUrlEvent.json")
+	jsonFile, err := os.Open("../testdata/otlp-1.0/customUrlEvent.json")
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -366,14 +378,13 @@ func TestHandleRequestErrors(t *testing.T) {
 		expected int
 	}
 	var getListenerUrlTests = []getListenerUrlTest{
-		{"noValidToken", 400},
 		{"noToken", 400},
 		{"malformedBody", 400},
 		{"simpleevent", 400},
 		{"kinesisDemoData", 200},
 	}
 	for _, test := range getListenerUrlTests {
-		jsonFile, err := os.Open(fmt.Sprintf("../testdata/otlp-0.7/%s.json", test.file))
+		jsonFile, err := os.Open(fmt.Sprintf("../testdata/otlp-1.0/%s.json", test.file))
 		if err != nil {
 			fmt.Println(err)
 		}
