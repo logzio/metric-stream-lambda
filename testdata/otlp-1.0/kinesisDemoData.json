@@ -1,0 +1,94 @@
+
+{
+  "version": "1.0",
+  "resource": "/test-python",
+  "path": "/test-python",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Length": "332686",
+    "Content-Type": "application/json",
+    "Host": ".execute-api.us-east-1.amazonaws.com",
+    "User-Agent": "Amazon Kinesis Data Firehose Agent/1.0",
+    "X-Amz-Firehose-Access-Key": "token",
+    "X-Amz-Firehose-Protocol-Version": "1.0",
+    "X-Amz-Firehose-Request-Id": "16bb3d55-d08b-42d4-9eac-61e4f198f2c8",
+    "X-Amz-Firehose-Source-Arn": "arn:aws:firehose:us-east-1:486140753397:deliverystream/cw-metrics-go",
+    "X-Amzn-Trace-Id": "Root=1-6267be3b-73483c9e1f48b4bf2047c7f9",
+    "X-Forwarded-For": "44.192.14.148",
+    "X-Forwarded-Port": "443",
+    "X-Forwarded-Proto": "https"
+  },
+  "multiValueHeaders": {
+    "Content-Length": [
+      "332686"
+    ],
+    "Content-Type": [
+      "application/json"
+    ],
+    "Host": [
+      "iaxy965hw7.execute-api.us-east-1.amazonaws.com"
+    ],
+    "User-Agent": [
+      "Amazon Kinesis Data Firehose Agent/1.0"
+    ],
+    "X-Amz-Firehose-Access-Key": [
+      "token"
+    ],
+    "X-Amz-Firehose-Protocol-Version": [
+      "1.0"
+    ],
+    "X-Amz-Firehose-Request-Id": [
+      "-d08b-42d4-9eac-61e4f198f2c8"
+    ],
+    "X-Amz-Firehose-Source-Arn": [
+      "arn:aws:firehose:us-east-1:486140753397:deliverystream/cw-metrics-go"
+    ],
+    "X-Amzn-Trace-Id": [
+      "Root=1-6267be3b-"
+    ],
+    "X-Forwarded-For": [
+      "44.192.14.148"
+    ],
+    "X-Forwarded-Port": [
+      "443"
+    ],
+    "X-Forwarded-Proto": [
+      "https"
+    ]
+  },
+  "queryStringParameters": "",
+  "multiValueQueryStringParameters": "",
+  "requestContext": {
+    "accountId": "486140753397",
+    "apiId": "",
+    "domainName": "iaxy965hw7.execute-api.us-east-1.amazonaws.com",
+    "domainPrefix": "iaxy965hw7",
+    "extendedRequestId": "RLqpThueIAMEPtA=",
+    "httpMethod": "POST",
+    "identity": {
+      "accessKey": "",
+      "accountId": "",
+      "caller": "",
+      "cognitoAmr": "",
+      "cognitoAuthenticationProvider": "",
+      "cognitoAuthenticationType": "",
+      "cognitoIdentityId": "",
+      "cognitoIdentityPoolId": "",
+      "principalOrgId": "",
+      "sourceIp": "",
+      "userAgent": "Amazon Kinesis Data Firehose Agent/1.0",
+      "userArn": ""
+    },
+    "path": "/test-python",
+    "protocol": "HTTP/1.1",
+    "requestId": "RLqpThueIAMEPtA=",
+    "requestTime": "26/Apr/2022:09:41:15 +0000",
+    "requestTimeEpoch": 1650966075345,
+    "resourceId": "ANY /test-python",
+    "resourcePath": "/test-python",
+    "stage": "$default"
+  },
+  "pathParameters": "",
+  "stageVariables": "",
+  "body": "{\"requestId\":\"605a5a16-f91b-4e20-b525-9143d3b8e831\",\"timestamp\":1650963501265,\"records\":[{\"data\":\"eyJDSEFOR0UiOi0wLjM2LCJQUklDRSI6MTg2LjUsIlRJQ0tFUl9TWU1CT0wiOiJRQVoiLCJTRUNUT1IiOiJGSU5BTkNJQUwifQ==\"}]}"
+}
