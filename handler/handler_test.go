@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -367,9 +368,87 @@ func TestHandleRequest(t *testing.T) {
 	request := events.APIGatewayProxyRequest{}
 	json.Unmarshal(byteValue, &request)
 	request.Headers["x-amz-firehose-common-attributes"] = fmt.Sprintf("{\"commonAttributes\":{\"LOGZIO_TOKEN\":\"token\",\"CUSTOM_LISTENER\":\"%s\"}}", server.URL)
-	_, err = HandleRequest(ctx, request)
+	result, err := HandleRequest(ctx, request)
 	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, result.StatusCode)
+	assert.Greater(t, metricCount, 0)
+}
 
+func useFastRemoteWriteRetry(t *testing.T) {
+	original := remoteWriteRetry
+	remoteWriteRetry.InitialInterval = 10 * time.Millisecond
+	remoteWriteRetry.MaxInterval = 20 * time.Millisecond
+	remoteWriteRetry.MaxElapsedTime = 200 * time.Millisecond
+	t.Cleanup(func() { remoteWriteRetry = original })
+}
+
+func newCustomUrlRequest(t *testing.T, listenerUrl string) events.APIGatewayProxyRequest {
+	byteValue, err := os.ReadFile("../testdata/otlp-1.0/customUrlEvent.json")
+	require.NoError(t, err)
+	request := events.APIGatewayProxyRequest{}
+	require.NoError(t, json.Unmarshal(byteValue, &request))
+	request.Headers["x-amz-firehose-common-attributes"] = fmt.Sprintf(
+		"{\"commonAttributes\":{\"CUSTOM_LISTENER\":\"%s\"}}", listenerUrl)
+	return request
+}
+
+func TestHandleRequestReportsRemoteWriteFailureToFirehose(t *testing.T) {
+	tests := []struct {
+		name               string
+		listenerStatus     int
+		expectedStatus     int
+		expectedRequests   int32
+		expectRetriedSends bool
+	}{
+		{name: "listener 5xx is retried, then reported", listenerStatus: http.StatusInternalServerError,
+			expectedStatus: http.StatusInternalServerError, expectRetriedSends: true},
+		{name: "listener 4xx is not retried and is reported", listenerStatus: http.StatusBadRequest,
+			expectedStatus: http.StatusInternalServerError, expectedRequests: 1},
+		{name: "listener 401 is reported as 401", listenerStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, expectedRequests: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			useFastRemoteWriteRetry(t)
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(test.listenerStatus)
+			}))
+			defer server.Close()
+
+			result, err := HandleRequest(context.Background(), newCustomUrlRequest(t, server.URL))
+
+			assert.NoError(t, err)
+			assert.Equal(t, test.expectedStatus, result.StatusCode)
+			assert.Contains(t, result.Body, "Error while sending metrics")
+			if test.expectRetriedSends {
+				assert.Greater(t, requests.Load(), int32(1))
+			} else {
+				assert.Equal(t, test.expectedRequests, requests.Load())
+			}
+		})
+	}
+}
+
+func TestHandleRequestRecoversFromTransientRemoteWriteFailure(t *testing.T) {
+	useFastRemoteWriteRetry(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	result, err := HandleRequest(context.Background(), newCustomUrlRequest(t, server.URL))
+
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, result.StatusCode)
+	assert.Greater(t, requests.Load(), int32(2))
 }
 
 func TestHandleRequestErrors(t *testing.T) {
@@ -383,6 +462,10 @@ func TestHandleRequestErrors(t *testing.T) {
 		{"simpleevent", 400},
 		{"kinesisDemoData", 200},
 	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
 	for _, test := range getListenerUrlTests {
 		jsonFile, err := os.Open(fmt.Sprintf("../testdata/otlp-1.0/%s.json", test.file))
 		if err != nil {
@@ -392,6 +475,10 @@ func TestHandleRequestErrors(t *testing.T) {
 		byteValue, _ := ioutil.ReadAll(jsonFile)
 		request := events.APIGatewayProxyRequest{}
 		json.Unmarshal(byteValue, &request)
+		if request.Headers != nil {
+			request.Headers["x-amz-firehose-common-attributes"] = fmt.Sprintf(
+				"{\"commonAttributes\":{\"CUSTOM_LISTENER\":\"%s\"}}", server.URL)
+		}
 		result, err := HandleRequest(ctx, request)
 		assert.Equal(t, test.expected, result.StatusCode)
 		err = jsonFile.Close()

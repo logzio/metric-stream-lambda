@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/config/configtelemetry"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -39,6 +40,17 @@ const (
 	cloudRegionAtt    = "cloud.region"
 )
 
+// Retries happen inside ConsumeMetrics so a failed export is reported to Firehose, which then retries the whole
+// batch or backs it up to S3. MaxElapsedTime is kept well below the 30s API Gateway integration timeout.
+var remoteWriteRetry = configretry.BackOffConfig{
+	Enabled:             true,
+	InitialInterval:     100 * time.Millisecond,
+	RandomizationFactor: 0.5,
+	Multiplier:          2,
+	MaxInterval:         time.Second,
+	MaxElapsedTime:      5 * time.Second,
+}
+
 type handlerConfig struct {
 	LogzioToken string
 	EnvId       string
@@ -48,11 +60,12 @@ type handlerConfig struct {
 }
 
 func initLogger(ctx context.Context, handlerCfg handlerConfig) *zap.Logger {
-	awsRequestId, account, logzioIdentifier := "", "", ""
+	awsRequestId, account, region, logzioIdentifier := "", "", "", ""
 	if lambdaContext, ok := lambdacontext.FromContext(ctx); ok {
 		awsRequestId = lambdaContext.AwsRequestID
 	}
 	if arnStr := strings.Split(handlerCfg.FirehoseArn, ":"); len(arnStr) > 4 {
+		region = arnStr[3]
 		account = arnStr[4]
 	}
 	if len(handlerCfg.LogzioToken) >= 5 {
@@ -63,6 +76,7 @@ func initLogger(ctx context.Context, handlerCfg handlerConfig) *zap.Logger {
 	config.OutputPaths = []string{"stdout"}
 	config.InitialFields = map[string]interface{}{
 		"aws_account":               account,
+		"aws_region":                region,
 		"lambda_invocation_id":      awsRequestId,
 		"firehose_request_id":       handlerCfg.RequestId,
 		"logzio_account_identifier": logzioIdentifier,
@@ -177,11 +191,13 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, handlerCfg handlerConf
 			Enabled: false,
 		},
 		ResourceToTelemetrySettings: resourcetotelemetry.Settings{Enabled: true},
+		// The queue must stay disabled: with it, ConsumeMetrics only enqueues and export failures are logged and
+		// dropped while Firehose still receives 200.
 		RemoteWriteQueue: prometheusremotewriteexporter.RemoteWriteQueue{
-			Enabled:      true,
+			Enabled:      false,
 			NumConsumers: 3,
-			QueueSize:    1000,
 		},
+		BackOffConfig:     remoteWriteRetry,
 		MaxBatchSizeBytes: 3000000,
 	}
 	settings := exporter.Settings{
@@ -341,9 +357,11 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		log.Info("Sending metrics", zap.Int64("bulk_number", int64(recordIdx)))
 		if shippingErr := metricsExporter.ConsumeMetrics(ctx, metricsToSend); shippingErr != nil {
 			if strings.Contains(shippingErr.Error(), "status 401") {
+				_ = metricsExporter.Shutdown(ctx)
 				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", shippingErr), nil
 			}
-			shippingErrors.Collect(err)
+			shippingErrors.Collect(shippingErr)
+			break
 		} else {
 			metricCount += metricsToSend.MetricCount()
 			dataPointCount += metricsToSend.DataPointCount()
