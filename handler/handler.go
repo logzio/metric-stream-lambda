@@ -41,15 +41,18 @@ const (
 )
 
 // Retries happen inside ConsumeMetrics so a failed export is reported to Firehose, which then retries the whole
-// batch or backs it up to S3. MaxElapsedTime is kept well below the 30s API Gateway integration timeout.
+// batch or backs it up to S3. MaxElapsedTime leaves room for at least two retries after a request timeout.
 var remoteWriteRetry = configretry.BackOffConfig{
 	Enabled:             true,
 	InitialInterval:     100 * time.Millisecond,
 	RandomizationFactor: 0.5,
 	Multiplier:          2,
 	MaxInterval:         time.Second,
-	MaxElapsedTime:      5 * time.Second,
+	MaxElapsedTime:      15 * time.Second,
 }
+
+var remoteWriteTimeout = 5 * time.Second
+var exportDeadline = 25 * time.Second
 
 type handlerConfig struct {
 	LogzioToken string
@@ -181,7 +184,7 @@ func createPrometheusRemoteWriteExporter(log *zap.Logger, handlerCfg handlerConf
 		ExternalLabels: map[string]string{"p8s_logzio_name": handlerCfg.EnvId},
 		ClientConfig: confighttp.ClientConfig{
 			Endpoint: handlerCfg.url,
-			Timeout:  5 * time.Second,
+			Timeout:  remoteWriteTimeout,
 			Headers:  map[string]configopaque.String{"Authorization": configopaque.String(fmt.Sprintf("Bearer %s", handlerCfg.LogzioToken))},
 		},
 		TargetInfo: &prometheusremotewriteexporter.TargetInfo{
@@ -343,7 +346,13 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		return firehoseResponseClient.GenerateValidFirehoseResponse(500, "Error while unmarshalling request body:", err), nil
 	}
 	records := body["records"].([]interface{})
+	exportCtx, cancelExport := context.WithTimeout(ctx, exportDeadline)
+	defer cancelExport()
 	for recordIdx, record := range records {
+		if deadlineErr := exportCtx.Err(); deadlineErr != nil {
+			shippingErrors.Collect(fmt.Errorf("export deadline reached before bulk %d: %w", recordIdx, deadlineErr))
+			break
+		}
 		data := record.(map[string]interface{})["data"].(string)
 		rawDecodedText, _ := base64Decode(data)
 		if isDemoData(rawDecodedText) {
@@ -355,7 +364,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			return firehoseResponseClient.GenerateValidFirehoseResponse(400, "Error processing record:", err), nil
 		}
 		log.Info("Sending metrics", zap.Int64("bulk_number", int64(recordIdx)))
-		if shippingErr := metricsExporter.ConsumeMetrics(ctx, metricsToSend); shippingErr != nil {
+		if shippingErr := metricsExporter.ConsumeMetrics(exportCtx, metricsToSend); shippingErr != nil {
 			if strings.Contains(shippingErr.Error(), "status 401") {
 				_ = metricsExporter.Shutdown(ctx)
 				return firehoseResponseClient.GenerateValidFirehoseResponse(401, "Error while sending metrics:", shippingErr), nil

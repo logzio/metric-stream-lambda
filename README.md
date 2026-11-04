@@ -15,7 +15,7 @@ This function has the following limitations:
 ### Changelog
 - v2.0.1
   - Report remote write failures to Firehose (non-200 response) instead of returning 200 and dropping the data, so Firehose retries the batch and backs it up to S3
-  - Retry transient remote write failures (5xx, timeouts) with exponential backoff for up to 5 seconds
+  - Retry transient remote write failures (5xx, timeouts) with exponential backoff for up to 15 seconds per bulk, and stop exporting after 25 seconds so Firehose gets the error before the 30 second API Gateway timeout
   - Fix a nil error being collected on shipping failure
   - Add `aws_region` (from the Firehose source ARN) to each log
 - v2.0.0

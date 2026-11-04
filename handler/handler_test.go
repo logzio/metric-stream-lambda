@@ -378,8 +378,13 @@ func useFastRemoteWriteRetry(t *testing.T) {
 	original := remoteWriteRetry
 	remoteWriteRetry.InitialInterval = 10 * time.Millisecond
 	remoteWriteRetry.MaxInterval = 20 * time.Millisecond
-	remoteWriteRetry.MaxElapsedTime = 200 * time.Millisecond
-	t.Cleanup(func() { remoteWriteRetry = original })
+	remoteWriteRetry.MaxElapsedTime = 1 * time.Second
+	originalTimeout := remoteWriteTimeout
+	remoteWriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() {
+		remoteWriteRetry = original
+		remoteWriteTimeout = originalTimeout
+	})
 }
 
 func newCustomUrlRequest(t *testing.T, listenerUrl string) events.APIGatewayProxyRequest {
@@ -449,6 +454,61 @@ func TestHandleRequestRecoversFromTransientRemoteWriteFailure(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusOK, result.StatusCode)
 	assert.Greater(t, requests.Load(), int32(2))
+}
+
+func TestHandleRequestRetriesTimedOutRemoteWrite(t *testing.T) {
+	useFastRemoteWriteRetry(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			time.Sleep(2 * remoteWriteTimeout)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	result, err := HandleRequest(context.Background(), newCustomUrlRequest(t, server.URL))
+
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, result.StatusCode)
+	assert.Greater(t, requests.Load(), int32(1))
+}
+
+func TestHandleRequestStopsExportingAtDeadline(t *testing.T) {
+	useFastRemoteWriteRetry(t)
+	originalDeadline := exportDeadline
+	exportDeadline = 300 * time.Millisecond
+	t.Cleanup(func() { exportDeadline = originalDeadline })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	start := time.Now()
+	result, err := HandleRequest(context.Background(), newCustomUrlRequest(t, server.URL))
+
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusInternalServerError, result.StatusCode)
+	assert.Less(t, time.Since(start), remoteWriteRetry.MaxElapsedTime)
+}
+
+func TestHandleRequestSkipsRecordsAfterDeadline(t *testing.T) {
+	originalDeadline := exportDeadline
+	exportDeadline = 0
+	t.Cleanup(func() { exportDeadline = originalDeadline })
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	result, err := HandleRequest(context.Background(), newCustomUrlRequest(t, server.URL))
+
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusInternalServerError, result.StatusCode)
+	assert.Contains(t, result.Body, "export deadline reached")
+	assert.Equal(t, int32(0), requests.Load())
 }
 
 func TestHandleRequestErrors(t *testing.T) {
