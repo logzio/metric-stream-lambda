@@ -17,9 +17,6 @@ jobs:
       - name: Build function
         run: make function
       - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        with:
-          asset_path: ./function.zip
-          asset_name: function.zip
-          asset_content_type: application/zip
-          upload_url: ${{ github.event.release.upload_url }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" function.zip --repo "${{ github.repository }}" --clobber
