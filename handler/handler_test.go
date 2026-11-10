@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/gogo/protobuf/proto"
+	golangproto "github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
@@ -13,6 +16,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -575,4 +579,197 @@ func TestRemoveDuplicateValues(t *testing.T) {
 			assert.Equal(t, result, test.expected, "Expected %v, got %v", test.expected, result)
 		})
 	}
+}
+
+func loadFixtureMessages(t *testing.T, path string) [][]byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var event struct {
+		Body string `json:"body"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &event))
+	var body struct {
+		Records []struct {
+			Data string `json:"data"`
+		} `json:"records"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(event.Body), &body))
+	require.Greater(t, len(body.Records), 1, "fixture needs several single-message records")
+	messages := make([][]byte, 0, len(body.Records))
+	for _, record := range body.Records {
+		decoded, err := base64.StdEncoding.DecodeString(record.Data)
+		require.NoError(t, err)
+		messages = append(messages, decoded)
+	}
+	return messages
+}
+
+func processRaw(t *testing.T, raw []byte) (pmetric.Metrics, error) {
+	t.Helper()
+	return processRecord(golangproto.NewBuffer(raw), zap.NewNop())
+}
+
+func metricNames(metrics pmetric.Metrics) []string {
+	var names []string
+	for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+		scopeMetrics := metrics.ResourceMetrics().At(i).ScopeMetrics()
+		for j := 0; j < scopeMetrics.Len(); j++ {
+			for k := 0; k < scopeMetrics.At(j).Metrics().Len(); k++ {
+				names = append(names, scopeMetrics.At(j).Metrics().At(k).Name())
+			}
+		}
+	}
+	return names
+}
+
+func TestProcessRecordDecodesEveryMessageInRecord(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+
+	var expectedDataPoints, expectedMetrics int
+	var expectedNames []string
+	for _, message := range messages {
+		metrics, err := processRaw(t, message)
+		require.NoError(t, err)
+		expectedDataPoints += metrics.DataPointCount()
+		expectedMetrics += metrics.MetricCount()
+		expectedNames = append(expectedNames, metricNames(metrics)...)
+	}
+
+	combined, err := processRaw(t, bytes.Join(messages, nil))
+
+	require.NoError(t, err)
+	assert.Equal(t, expectedDataPoints, combined.DataPointCount())
+	assert.Equal(t, expectedMetrics, combined.MetricCount())
+	assert.Equal(t, expectedNames, metricNames(combined))
+}
+
+func TestProcessRecordSingleMessage(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+
+	metrics, err := processRaw(t, messages[0])
+
+	require.NoError(t, err)
+	assert.Greater(t, metrics.DataPointCount(), 0)
+}
+
+func TestProcessRecordRejectsRecordWithMalformedFirstMessage(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+	tests := []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "empty record", raw: []byte{}},
+		{name: "truncated first message", raw: messages[0][:len(messages[0])/2]},
+		{name: "length prefix without message", raw: []byte{0x80}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := processRaw(t, test.raw)
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestProcessRecordKeepsDecodedMessagesWhenLaterMessageIsMalformed(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+	firstOnly, err := processRaw(t, messages[0])
+	require.NoError(t, err)
+	firstTwo, err := processRaw(t, bytes.Join(messages[:2], nil))
+	require.NoError(t, err)
+	tests := []struct {
+		name     string
+		raw      []byte
+		expected pmetric.Metrics
+	}{
+		{name: "truncated second message", raw: append(append([]byte{}, messages[0]...), messages[1][:len(messages[1])/2]...), expected: firstOnly},
+		{name: "trailing length prefix without message", raw: append(append([]byte{}, messages[0]...), 0x80), expected: firstOnly},
+		{name: "truncated third message", raw: append(bytes.Join(messages[:2], nil), messages[0][:len(messages[0])/2]...), expected: firstTwo},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core, logs := observer.New(zap.WarnLevel)
+
+			metrics, err := processRecord(golangproto.NewBuffer(test.raw), zap.New(core))
+
+			require.NoError(t, err)
+			assert.Equal(t, test.expected.DataPointCount(), metrics.DataPointCount())
+			assert.Equal(t, metricNames(test.expected), metricNames(metrics))
+			assert.Equal(t, 1, logs.FilterMessage("Skipping the rest of the record after a malformed message").Len())
+		})
+	}
+}
+
+func countRemoteWriteSamples(t *testing.T, r *http.Request) int {
+	t.Helper()
+	body, err := ioutil.ReadAll(r.Body)
+	require.NoError(t, err)
+	decoded, err := snappy.Decode(nil, body)
+	require.NoError(t, err)
+	writeReq := &prompb.WriteRequest{}
+	require.NoError(t, proto.Unmarshal(decoded, writeReq))
+	samples := 0
+	for _, ts := range writeReq.Timeseries {
+		samples += len(ts.Samples)
+	}
+	return samples
+}
+
+func handleRecords(t *testing.T, records [][]byte) (int, int) {
+	t.Helper()
+	var samples atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		samples.Add(int64(countRemoteWriteSamples(t, r)))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	request := newCustomUrlRequest(t, server.URL)
+	encoded := make([]map[string]string, 0, len(records))
+	for _, record := range records {
+		encoded = append(encoded, map[string]string{"data": base64.StdEncoding.EncodeToString(record)})
+	}
+	body, err := json.Marshal(map[string]interface{}{"requestId": "test", "timestamp": 0, "records": encoded})
+	require.NoError(t, err)
+	request.Body = string(body)
+
+	result, err := HandleRequest(context.Background(), request)
+	require.NoError(t, err)
+	return result.StatusCode, int(samples.Load())
+}
+
+func TestHandleRequestShipsEveryMessageOfMultiMessageRecord(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/customUrlEvent.json")
+
+	separateStatus, separateSamples := handleRecords(t, messages)
+	combinedStatus, combinedSamples := handleRecords(t, [][]byte{bytes.Join(messages, nil)})
+
+	assert.Equal(t, http.StatusOK, separateStatus)
+	assert.Equal(t, http.StatusOK, combinedStatus)
+	assert.Greater(t, separateSamples, 0)
+	assert.Equal(t, separateSamples, combinedSamples)
+}
+
+func TestHandleRequestRejectsRecordWithMalformedFirstMessage(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/customUrlEvent.json")
+
+	status, samples := handleRecords(t, [][]byte{messages[0][:len(messages[0])/2]})
+
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, 0, samples)
+}
+
+func TestHandleRequestShipsDecodedMessagesOfRecordWithMalformedTail(t *testing.T) {
+	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/customUrlEvent.json")
+	_, firstMessageSamples := handleRecords(t, [][]byte{messages[0]})
+	truncated := append(append([]byte{}, messages[0]...), messages[1][:len(messages[1])/2]...)
+
+	status, samples := handleRecords(t, [][]byte{truncated})
+
+	assert.Equal(t, http.StatusOK, status)
+	assert.Greater(t, firstMessageSamples, 0)
+	assert.Equal(t, firstMessageSamples, samples)
 }
