@@ -23,6 +23,13 @@ This function has the following limitations:
 
 ### Changelog
 
+- v1.0.3
+  - Decode every `ExportMetricsServiceRequest` in a Firehose record. A record can hold several length-prefixed messages, and only the first one was processed, so the rest of the metrics were dropped while Firehose still received 200
+  - Log a warning when a record ends with a malformed message, and still ship the messages decoded before it
+  - Retry transient remote write failures (5xx, timeouts, connection errors) with exponential backoff for up to 15 seconds per bulk, with a 5 second request timeout, and stop exporting after 25 seconds so Firehose gets the error before the 30 second API Gateway timeout
+  - Stop sending the remaining bulks after a failed one, since Firehose retries the whole batch
+  - Log only the namespaces of the current invocation
+  - Build a `bootstrap` binary for the `provided.al2023` runtime
 - v1.0.2
   - Stop trying to send bulks if encountered 401 status code
   - Add logzio identifier to each log (5 last chars of the shipping token)
