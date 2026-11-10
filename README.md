@@ -16,6 +16,8 @@ This function has the following limitations:
 - v2.0.3
   - Decode every `ExportMetricsServiceRequest` in a Firehose record. A record can hold several length-prefixed messages, and only the first one was processed, so the rest of the metrics were dropped while Firehose still received 200
   - Log a warning when a record ends with a malformed message, and still ship the messages decoded before it
+- v2.0.2
+  - No functional changes (release process fix)
 - v2.0.1
   - Report remote write failures to Firehose (non-200 response) instead of returning 200 and dropping the data, so Firehose retries the batch and backs it up to S3
   - Retry transient remote write failures (5xx, timeouts) with exponential backoff for up to 15 seconds per bulk, and stop exporting after 25 seconds so Firehose gets the error before the 30 second API Gateway timeout
