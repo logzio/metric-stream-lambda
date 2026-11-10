@@ -6,19 +6,18 @@ on:
 
 jobs:
   upload:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-      - name: Set up Go
-        uses: actions/setup-go@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: 1.17
+          go-version: '1.22.0'
       - name: Build function
         run: make function
       - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        with:
-          asset_path: ./function.zip
-          asset_name: function.zip
-          asset_content_type: application/zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" function.zip --repo "$GITHUB_REPOSITORY" --clobber

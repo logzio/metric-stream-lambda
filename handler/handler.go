@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambdacontext"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/golang/protobuf/proto"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/consumer/pdata"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
 	pb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"go.uber.org/zap"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -30,6 +33,18 @@ const (
 )
 
 var detectedNamespaces []string
+
+// Firehose gets an error back and retries the whole batch or backs it up to S3, so a bulk is only retried for a
+// bounded time and the export stops before the 30 second API Gateway timeout.
+var remoteWriteRetryInitialInterval = 100 * time.Millisecond
+var remoteWriteRetryMaxInterval = time.Second
+var remoteWriteRetryMaxElapsedTime = 15 * time.Second
+var remoteWriteTimeout = 5 * time.Second
+var exportDeadline = 25 * time.Second
+
+var resolveListenerUrl = getListenerUrl
+
+var errConvertingRecord = errors.New("error while converting otlp proto message to proto bytes")
 
 type ErrorCollector []error
 
@@ -254,9 +269,91 @@ func summaryValuesToMetrics(metricsToSendSlice pdata.InstrumentationLibraryMetri
 		quantileMetric.CopyTo(metricsToSendSlice.AppendEmpty().Metrics().AppendEmpty())
 	}
 }
+
+// A Firehose record holds one or more ExportMetricsServiceRequest messages, each prefixed with its varint length,
+// so every message has to be decoded or the metrics after the first one are lost.
+// Only a failure on the first message fails the record: a broken later message is logged and skipped so a record
+// that used to ship its first message still does, instead of failing the whole Firehose batch.
+func processRecord(protoBuffer *proto.Buffer, log zap.SugaredLogger) (pdata.Metrics, error) {
+	// represents the metrics to send after converting from summary to sum, count, min, max (those are the metrics we are actually going to send)
+	metricsToSend := pdata.NewMetrics()
+	aggregatedInstrumentationLibraryMetrics := metricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
+	for messageIdx := 0; messageIdx == 0 || len(protoBuffer.Unread()) > 0; messageIdx++ {
+		metrics, err := decodeExportRequest(protoBuffer)
+		if err != nil {
+			if messageIdx == 0 {
+				return pdata.Metrics{}, err
+			}
+			log.Warnw("Skipping the rest of the record after a malformed message",
+				"message_index", messageIdx,
+				"skipped_bytes", len(protoBuffer.Unread()),
+				"error", err)
+			break
+		}
+		// Lopping threw all metrics and data points, generate new metrics (sum, count, min, max) and enhance labels with logz.io naming conventions and resource attributes
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			resource := metrics.ResourceMetrics().At(i)
+			resourceAttributes := resource.Resource().Attributes()
+			for j := 0; j < resource.InstrumentationLibraryMetrics().Len(); j++ {
+				instrumentationLibraryMetrics := resource.InstrumentationLibraryMetrics().At(j)
+				for k := 0; k < instrumentationLibraryMetrics.Metrics().Len(); k++ {
+					metric := instrumentationLibraryMetrics.Metrics().At(k)
+					summaryValuesToMetrics(aggregatedInstrumentationLibraryMetrics, metric, resourceAttributes)
+				}
+			}
+		}
+	}
+	return metricsToSend, nil
+}
+
+func decodeExportRequest(protoBuffer *proto.Buffer) (pdata.Metrics, error) {
+	ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
+	if err := protoBuffer.DecodeMessage(ExportMetricsServiceRequest); err != nil {
+		return pdata.Metrics{}, err
+	}
+	// Converting otlp proto message to proto bytes
+	protoBytes, err := proto.Marshal(ExportMetricsServiceRequest)
+	if err != nil {
+		return pdata.Metrics{}, fmt.Errorf("%w: %s", errConvertingRecord, err)
+	}
+	// Converting otlp proto bytes to pdata.metrics
+	metrics, _ := pdata.MetricsFromOtlpProtoBytes(protoBytes)
+	return metrics, nil
+}
+
+// 5xx responses and transport errors (timeouts, refused or reset connections) are transient. The exporter marks
+// transport errors as permanent, so they are detected separately. 4xx responses are not retried.
+func isRetryableRemoteWriteError(err error) bool {
+	if !consumererror.IsPermanent(err) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func pushMetricsWithRetry(ctx context.Context, metricsExporter *prometheusremotewriteexporter.PRWExporter, metrics pdata.Metrics) error {
+	retryBackoff := backoff.NewExponentialBackOff()
+	retryBackoff.InitialInterval = remoteWriteRetryInitialInterval
+	retryBackoff.MaxInterval = remoteWriteRetryMaxInterval
+	retryBackoff.MaxElapsedTime = remoteWriteRetryMaxElapsedTime
+	var lastErr error
+	retryErr := backoff.Retry(func() error {
+		lastErr = metricsExporter.PushMetrics(ctx, metrics)
+		if lastErr == nil || isRetryableRemoteWriteError(lastErr) {
+			return lastErr
+		}
+		return backoff.Permanent(lastErr)
+	}, backoff.WithContext(retryBackoff, ctx))
+	if retryErr != nil && lastErr != nil {
+		return lastErr
+	}
+	return retryErr
+}
+
 func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	metricCount := 0
 	dataPointCount := 0
+	detectedNamespaces = nil
 	shippingErrors := new(ErrorCollector)
 	// get requestId to match firehose response requirements
 	requestId := request.Headers["X-Amz-Firehose-Request-Id"]
@@ -287,7 +384,8 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		Namespace:      "",
 		ExternalLabels: map[string]string{"p8s_logzio_name": "otlp-cloudwatch-stream-metrics"},
 		HTTPClientSettings: confighttp.HTTPClientSettings{
-			Endpoint: getListenerUrl(log),
+			Endpoint: resolveListenerUrl(log),
+			Timeout:  remoteWriteTimeout,
 			Headers:  map[string]string{"Authorization": fmt.Sprintf("Bearer %s", LogzioToken)},
 		},
 	}
@@ -330,7 +428,14 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		}
 	*/
 	records := body["records"].([]interface{})
+	exportCtx, cancelExport := context.WithTimeout(ctx, exportDeadline)
+	defer cancelExport()
 	for bulkNum, record := range records {
+		if deadlineErr := exportCtx.Err(); deadlineErr != nil {
+			log.Warnf("Export deadline reached before bulk %d: %s", bulkNum, deadlineErr)
+			shippingErrors.Collect(fmt.Errorf("export deadline reached before bulk %d: %w", bulkNum, deadlineErr))
+			break
+		}
 		//Converting the data to string
 		data := record.(map[string]interface{})["data"].(string)
 		//Decoding data and convert to otlp proto message
@@ -339,43 +444,24 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 			continue
 		}
 		protoBuffer := proto.NewBuffer([]byte(rawDecodedText))
-		ExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
-		err = protoBuffer.DecodeMessage(ExportMetricsServiceRequest)
+		metricsToSend, err := processRecord(protoBuffer, log)
+		if errors.Is(err, errConvertingRecord) {
+			log.Warnf("Error while converting otlp proto message to proto bytes: %s", err)
+			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
+		}
 		if err != nil {
 			log.Warnf("Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message: %s", err)
 			return generateValidFirehoseResponse(400, requestId, "Error decoding otlp proto message, make sure you are using opentelemetry 0.7 metrics format. Error message:", err), nil
 		}
-		// Converting otlp proto message to proto bytes
-		protoBytes, err := proto.Marshal(ExportMetricsServiceRequest)
-		if err != nil {
-			log.Warnf("Error while converting otlp proto message to proto bytes: %s", err)
-			return generateValidFirehoseResponse(500, requestId, "Error while converting otlp proto message to proto bytes:", err), nil
-		}
-		// Converting otlp proto bytes to pdata.metrics
-		metrics, err := pdata.MetricsFromOtlpProtoBytes(protoBytes)
-		// represents the metrics to send after converting from summary to sum, count, min, max (those are the metrics we are actually going to send)
-		metricsToSend := pdata.NewMetrics()
-		aggregatedInstrumentationLibraryMetrics := metricsToSend.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics()
-		// Lopping threw all metrics and data points, generate new metrics (sum, count, min, max) and enhance labels with logz.io naming conventions and resource attributes
-		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
-			resource := metrics.ResourceMetrics().At(i)
-			resourceAttributes := resource.Resource().Attributes()
-			for j := 0; j < resource.InstrumentationLibraryMetrics().Len(); j++ {
-				instrumentationLibraryMetrics := resource.InstrumentationLibraryMetrics().At(j)
-				for k := 0; k < instrumentationLibraryMetrics.Metrics().Len(); k++ {
-					metric := instrumentationLibraryMetrics.Metrics().At(k)
-					summaryValuesToMetrics(aggregatedInstrumentationLibraryMetrics, metric, resourceAttributes)
-				}
-			}
-		}
 		log.Infof("Sending metrics, Bulk number: %d", bulkNum)
-		err = metricsExporter.PushMetrics(ctx, metricsToSend)
+		err = pushMetricsWithRetry(exportCtx, metricsExporter, metricsToSend)
 		if err != nil {
 			log.Warnf("Error while sending metrics: %s", err)
 			if strings.Contains(err.Error(), "status 401") {
 				return generateValidFirehoseResponse(400, requestId, "Error while sending metrics:", err), nil
 			}
 			shippingErrors.Collect(err)
+			break
 		} else {
 			numberOfMetrics, numberOfDataPoints := metricsToSend.MetricAndDataPointCount()
 			metricCount += numberOfMetrics
