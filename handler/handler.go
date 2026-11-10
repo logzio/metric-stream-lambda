@@ -280,10 +280,33 @@ func createMinMaxMetrics(metricName string, dp pmetric.SummaryDataPoint, resourc
 }
 
 func processRecord(protoBuffer *proto.Buffer, log *zap.Logger) (pmetric.Metrics, error) {
+	recordMetrics := pmetric.NewMetrics()
+	for messageIdx := 0; messageIdx == 0 || len(protoBuffer.Unread()) > 0; messageIdx++ {
+		messageMetrics, err := decodeExportRequest(protoBuffer)
+		if err != nil {
+			if messageIdx == 0 {
+				return pmetric.Metrics{}, err
+			}
+			log.Warn("Skipping the rest of the record after a malformed message",
+				zap.Int("message_index", messageIdx),
+				zap.Int("skipped_bytes", len(protoBuffer.Unread())),
+				zap.Error(err))
+			break
+		}
+		messageMetrics.ResourceMetrics().MoveAndAppendTo(recordMetrics.ResourceMetrics())
+	}
+	return recordMetrics, nil
+}
+
+func decodeExportRequest(protoBuffer *proto.Buffer) (pmetric.Metrics, error) {
 	protoExportMetricsServiceRequest := &pb.ExportMetricsServiceRequest{}
 	if err := protoBuffer.DecodeMessage(protoExportMetricsServiceRequest); err != nil {
 		return pmetric.Metrics{}, err
 	}
+	return convertExportRequest(protoExportMetricsServiceRequest)
+}
+
+func convertExportRequest(protoExportMetricsServiceRequest *pb.ExportMetricsServiceRequest) (pmetric.Metrics, error) {
 	protoBytes, marshalErr := proto.Marshal(protoExportMetricsServiceRequest)
 	if marshalErr != nil {
 		return pmetric.Metrics{}, marshalErr
