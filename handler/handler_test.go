@@ -581,9 +581,9 @@ func TestRemoveDuplicateValues(t *testing.T) {
 	}
 }
 
-func loadFixtureMessages(t *testing.T, path string) [][]byte {
+func loadFixtureMessages(t *testing.T) [][]byte {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile("../testdata/otlp-1.0/validEvent.json")
 	require.NoError(t, err)
 	var event struct {
 		Body string `json:"body"`
@@ -624,7 +624,7 @@ func metricNames(metrics pmetric.Metrics) []string {
 }
 
 func TestProcessRecordDecodesEveryMessageInRecord(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+	messages := loadFixtureMessages(t)
 
 	var expectedDataPoints, expectedMetrics int
 	var expectedNames []string
@@ -645,7 +645,7 @@ func TestProcessRecordDecodesEveryMessageInRecord(t *testing.T) {
 }
 
 func TestProcessRecordSingleMessage(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+	messages := loadFixtureMessages(t)
 
 	metrics, err := processRaw(t, messages[0])
 
@@ -654,7 +654,7 @@ func TestProcessRecordSingleMessage(t *testing.T) {
 }
 
 func TestProcessRecordRejectsRecordWithMalformedFirstMessage(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+	messages := loadFixtureMessages(t)
 	tests := []struct {
 		name string
 		raw  []byte
@@ -674,7 +674,7 @@ func TestProcessRecordRejectsRecordWithMalformedFirstMessage(t *testing.T) {
 }
 
 func TestProcessRecordKeepsDecodedMessagesWhenLaterMessageIsMalformed(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/validEvent.json")
+	messages := loadFixtureMessages(t)
 	firstOnly, err := processRaw(t, messages[0])
 	require.NoError(t, err)
 	firstTwo, err := processRaw(t, bytes.Join(messages[:2], nil))
@@ -742,7 +742,7 @@ func handleRecords(t *testing.T, records [][]byte) (int, int) {
 }
 
 func TestHandleRequestShipsEveryMessageOfMultiMessageRecord(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/customUrlEvent.json")
+	messages := loadFixtureMessages(t)
 
 	separateStatus, separateSamples := handleRecords(t, messages)
 	combinedStatus, combinedSamples := handleRecords(t, [][]byte{bytes.Join(messages, nil)})
@@ -754,7 +754,7 @@ func TestHandleRequestShipsEveryMessageOfMultiMessageRecord(t *testing.T) {
 }
 
 func TestHandleRequestRejectsRecordWithMalformedFirstMessage(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/customUrlEvent.json")
+	messages := loadFixtureMessages(t)
 
 	status, samples := handleRecords(t, [][]byte{messages[0][:len(messages[0])/2]})
 
@@ -763,7 +763,7 @@ func TestHandleRequestRejectsRecordWithMalformedFirstMessage(t *testing.T) {
 }
 
 func TestHandleRequestShipsDecodedMessagesOfRecordWithMalformedTail(t *testing.T) {
-	messages := loadFixtureMessages(t, "../testdata/otlp-1.0/customUrlEvent.json")
+	messages := loadFixtureMessages(t)
 	_, firstMessageSamples := handleRecords(t, [][]byte{messages[0]})
 	truncated := append(append([]byte{}, messages[0]...), messages[1][:len(messages[1])/2]...)
 
